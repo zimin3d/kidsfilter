@@ -17,6 +17,8 @@
 #  * объём статистики и логов в RAM ограничен.
 
 VERSION=2.0
+# журналы и статистика — история запросов детей: читать их может только root
+umask 077
 CONF_DIR=/etc/kidsfilter
 # рабочие файлы в RAM (/var/run = /tmp/run); не /tmp/kidsfilter — туда обычно копируют установщик
 RUN_DIR=/var/run/kidsfilter
@@ -27,6 +29,13 @@ BLOCK_PORT=5380
 KEEP_DAYS=30
 STATS_MAX_KB=
 LOG_MAX_KB=2048
+# копия статистики на флеше: не больше SAVE_MAX_KB и всегда оставлять свободными SAVE_RESERVE_KB
+SAVE_MAX_KB=1024
+SAVE_RESERVE_KB=512
+# адресов в allow4+allow6 больше этого — ночью наборы очищаются (CDN постоянно меняют адреса)
+ALLOW_MAX=20000
+# DNS-запросов в секунду с одного детского устройства (сверх — отбрасываются)
+DNS_RATE=100
 [ -f "$CONF_DIR/kidsfilter.conf" ] && . "$CONF_DIR/kidsfilter.conf"
 
 # предел статистики в RAM: 1/32 памяти, но не больше 8 МБ
@@ -369,8 +378,10 @@ eff_mode() {
 
 # ---------- генерация конфигурации ----------
 
+# gen_nft <режим> [0] — второй аргумент 0: без ограничения частоты DNS (для старых ядер/nft)
 gen_nft() {
 	m=$1
+	limit=${2:-1}
 	macs=$(kid_macs | join_comma)
 	s4=$(wl_ip4 | join_comma)
 	s6=$(wl_ip6 | join_comma)
@@ -389,6 +400,7 @@ table $TABLE {
 	counter fwd_blocked { }
 	counter router_blocked { }
 	counter blockpage_shown { }
+	counter dns_flood { }
 	chain dstnat { type nat hook prerouting priority dstnat - 5; policy accept; }
 	chain input { type filter hook input priority filter - 5; policy accept; }
 	chain forward { type filter hook forward priority filter - 5; policy accept; }
@@ -412,9 +424,18 @@ EOF
 	# HTTP к неразрешённым адресам (и к роутеру, куда DNS отправляет запрещённые домены) — на страницу блокировки.
 	# В nat-цепочку попадает только первый пакет соединения, поэтому счётчик считает соединения.
 	[ $bp = 1 ] && echo "add rule $TABLE dstnat iifname { $lan } ether saddr @kids_mac tcp dport 80 ip daddr != @allow4 ip daddr != @static4 counter name blockpage_shown redirect to :$BLOCK_PORT"
+	# защита от «зацикленной» программы: без предела поток DNS-запросов за минуты заполнил бы
+	# журнал в RAM. Сверх DNS_RATE в секунду с одного устройства запросы отбрасываются.
+	if [ "$limit" = 1 ]; then
+		echo "add set $TABLE dns_rate { type ether_addr; size 1024; flags dynamic,timeout; timeout 1m; }"
+		lim="add rule $TABLE input meta l4proto { tcp, udp } th dport $DNS_PORT update @dns_rate { ether saddr limit rate over $DNS_RATE/second burst $((DNS_RATE * 5)) packets } counter name dns_flood drop"
+	else
+		lim=
+	fi
 	cat <<EOF
 add rule $TABLE input iifname != { $lan } return
 add rule $TABLE input ether saddr != @kids_mac return
+${lim}
 add rule $TABLE input meta l4proto { tcp, udp } th dport $DNS_PORT accept
 add rule $TABLE input udp dport { 67, 547 } accept
 add rule $TABLE input meta l4proto { icmp, ipv6-icmp } accept
@@ -478,6 +499,9 @@ EOF
 		}'
 }
 
+# проверка и атомарная загрузка правил
+load_rules() { nft -c -f "$1" 2>/dev/null && nft -f "$1" 2>/dev/null; }
+
 # вызывается из /etc/init.d/kidsfilter при старте
 cmd_prepare() {
 	mkdir -p "$RUN_DIR"
@@ -491,15 +515,22 @@ cmd_prepare() {
 		ip link show dev "$i" >/dev/null 2>&1 || logger -t kidsfilter "интерфейс $i не найден (LAN_IF в $CONF_DIR/kidsfilter.conf)"
 	done
 	gen_nft "$m" > "$NFT_RULES"
-	if ! nft -c -f "$NFT_RULES" 2>/dev/null || ! nft -f "$NFT_RULES" 2>/dev/null; then
-		# таблица от старой версии (другие флаги наборов) — пересоздаём
-		nft delete table $TABLE 2>/dev/null
-		rm -f "$RESOLVED"
-		if ! nft -f "$NFT_RULES"; then
-			logger -t kidsfilter "правила nftables не загружены ($NFT_RULES)"
-			die "не удалось загрузить правила nftables ($NFT_RULES)"
+	gen_nft "$m" 0 > "$NFT_RULES.basic"
+	if ! load_rules "$NFT_RULES"; then
+		if load_rules "$NFT_RULES.basic"; then
+			mv "$NFT_RULES.basic" "$NFT_RULES"
+			logger -t kidsfilter "ограничение частоты DNS не поддерживается этой версией nftables — работаю без него"
+		else
+			# таблица от старой версии (другие флаги наборов) — пересоздаём
+			nft delete table $TABLE 2>/dev/null
+			rm -f "$RESOLVED"
+			if ! nft -f "$NFT_RULES" 2>/dev/null && ! { nft -f "$NFT_RULES.basic" && mv "$NFT_RULES.basic" "$NFT_RULES"; }; then
+				logger -t kidsfilter "правила nftables не загружены ($NFT_RULES)"
+				die "не удалось загрузить правила nftables ($NFT_RULES)"
+			fi
 		fi
 	fi
+	rm -f "$NFT_RULES.basic"
 	gen_dnsmasq "$m" > "$DNS_CONF"
 	# страница блокировки (своя версия — /etc/kidsfilter/blocked.html)
 	mkdir -p "$BLOCK_DIR"
@@ -532,6 +563,8 @@ drop_resolved() {
 		  else if (allowed($2)) keep[$1] = 1 }
 		END { for (ip in drop) if (!(ip in keep)) print ip }
 	' "$WL_CACHE" "$RESOLVED" | while read -r ip; do
+		# строка уходит в командную строку nft: ничего, кроме цифр, точек и двоеточий
+		case $ip in ''|*[!0-9a-f.:]*) continue;; esac
 		case $ip in *:*) nft delete element $TABLE allow6 "{ $ip }";; *) nft delete element $TABLE allow4 "{ $ip }";; esac
 	done 2>/dev/null
 	awk -F '\t' -v WLF="$WL_CACHE" "$AWK_LIB"'
@@ -630,8 +663,31 @@ merge_stats() {
 			{ n[$1 "\t" $2 "\t" $3 "\t" $4] += $5 }
 			END { for (k in n) print k "\t" n[k] }' > "$day.tmp" && mv "$day.tmp" "$day"
 		rm -f "$f"
+		[ "$(wc -c < "$day")" -gt $((STATS_MAX_KB * 512)) ] && compact_day "$day"
 	done
 	prune_stats
+}
+
+# День статистики больше половины предела (тысячи одноразовых адресов: трекеры, CDN, «зацикленная»
+# программа) — сначала редкие поддомены сворачиваются в базовый домен, затем при необходимости
+# остаются часовые итоги и самые частые домены. Так один день не съедает всю память.
+compact_day() {
+	f=$1; max=$((STATS_MAX_KB * 512))
+	awk -F '\t' "$AWK_LIB"'
+		{ d = $4; if (d != "*" && $5 <= 2) d = base(d)
+		  n[$1 "\t" $2 "\t" $3 "\t" d] += $5 }
+		END { for (k in n) print k "\t" n[k] }' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+	if [ "$(wc -c < "$f")" -gt "$max" ]; then
+		{
+			awk -F '\t' '$4 == "*"' "$f"
+			awk -F '\t' '$4 != "*" { print $5 "\t" $0 }' "$f" | sort -nr | cut -f2-
+		} | awk -v max="$max" '{ s += length($0) + 1; if (s > max) exit; print }' > "$f.tmp" && mv "$f.tmp" "$f"
+	fi
+	mark="$RUN_DIR/compacted-${f##*/}"
+	if [ ! -f "$mark" ]; then
+		: > "$mark"
+		logger -t kidsfilter "статистика за ${f##*/} больше $((max / 1024)) КБ — редкие адреса свёрнуты"
+	fi
 }
 
 # срок хранения и предел объёма: удаляются самые старые дни (сегодняшний остаётся всегда)
@@ -688,20 +744,67 @@ cmd_flush() {
 		parse_log "$RUN_DIR/dns.work" | merge_stats
 		{ [ -f "$RECENT" ] && cat "$RECENT"; parse_recent "$RUN_DIR/dns.work" 500; } | tail -n 500 > "$RECENT.new" &&
 			mv "$RECENT.new" "$RECENT"
-		{ [ -f "$RESOLVED" ] && cat "$RESOLVED"; parse_replies "$RUN_DIR/dns.work"; } | sort -u | tail -n 50000 > "$RESOLVED.new" &&
+		# без повторов, свежие в конце, не больше 20000 строк; строки не по формату отбрасываются
+		{ [ -f "$RESOLVED" ] && cat "$RESOLVED"; parse_replies "$RUN_DIR/dns.work"; } | awk -F '\t' '
+			NF != 2 || $1 !~ /^([0-9.]+|[0-9a-f:]+)$/ || $2 !~ /^[a-z0-9._-]+$/ { next }
+			{ if ($0 in at) delete line[at[$0]]; at[$0] = NR; line[NR] = $0 }
+			END { for (i = 1; i <= NR; i++) if (i in line) print line[i] }' | tail -n 20000 > "$RESOLVED.new" &&
 			mv "$RESOLVED.new" "$RESOLVED"
 	fi
 	rm -f "$RUN_DIR/dns.work"
 	drop_lock flush
 }
 
-# сохраняет статистику на флеш (раз в сутки по cron и при перезагрузке)
+# свободно на разделе с настройками, КБ (последняя строка df: длинное имя ФС переносится)
+flash_free_kb() { df -k "$CONF_DIR" 2>/dev/null | awk 'END { print $(NF-2) }'; }
+
+# сохраняет статистику на флеш (раз в сутки по cron и при перезагрузке).
+# Флеш не переполняется: копия сначала сжимается в RAM; если она больше SAVE_MAX_KB или после
+# записи останется меньше SAVE_RESERVE_KB свободного места, в копию попадает меньше старых дней.
+# «save nightly» (cron) заодно чистит разросшиеся наборы разрешённых адресов.
 cmd_save() {
 	cmd_flush
+	[ "$1" = nightly ] && trim_allow_sets
 	files=$(stats_days)
 	[ -n "$files" ] || return 0
-	# shellcheck disable=SC2086
-	( cd "$STATS_DIR" && cat $files ) | gzip -c > "$SAVED.tmp" && mv "$SAVED.tmp" "$SAVED"
+	tmp="$RUN_DIR/stats.save.gz"
+	while :; do
+		# shellcheck disable=SC2086
+		( cd "$STATS_DIR" && cat $files ) | gzip -c > "$tmp" || { rm -f "$tmp"; return 1; }
+		size=$(( ($(wc -c < "$tmp") + 1023) / 1024 ))
+		old=0; [ -f "$SAVED" ] && old=$(( $(wc -c < "$SAVED") / 1024 ))
+		free=$(flash_free_kb); is_num "$free" || free=$((SAVE_RESERVE_KB + size))
+		if [ "$size" -le "$SAVE_MAX_KB" ]; then
+			# хватает места рядом со старой копией — безопасная замена
+			if [ $((free - size)) -ge "$SAVE_RESERVE_KB" ]; then
+				cp "$tmp" "$SAVED.tmp" && mv "$SAVED.tmp" "$SAVED"
+				break
+			fi
+			# хватает только вместо старой копии
+			if [ $((free + old - size)) -ge "$SAVE_RESERVE_KB" ]; then
+				rm -f "$SAVED"; cp "$tmp" "$SAVED"
+				break
+			fi
+		fi
+		# shellcheck disable=SC2086
+		set -- $files
+		if [ $# -le 1 ]; then
+			logger -t kidsfilter "статистика не сохранена на флеш: мало места (свободно ${free} КБ)"
+			break
+		fi
+		shift; files=$*
+		logger -t kidsfilter "на флеш сохраняются не все дни статистики (места мало), первый день: $1"
+	done
+	rm -f "$tmp" "$SAVED.tmp"
+}
+
+trim_allow_sets() {
+	nft list tables 2>/dev/null | grep -q " kidsfilter$" || return 0
+	n=$(( $(set_size allow4) + $(set_size allow6) ))
+	[ "$n" -gt "$ALLOW_MAX" ] || return 0
+	nft flush set $TABLE allow4; nft flush set $TABLE allow6
+	rm -f "$RESOLVED"
+	logger -t kidsfilter "разрешённых адресов накопилось $n — наборы очищены, заполнятся заново по DNS"
 }
 
 days_arg() {
@@ -1146,6 +1249,9 @@ router_blocked	$([ $loaded = 1 ] && counter_val router_blocked)
 blockpage	$(blockpage_on && echo 1 || echo 0)
 blockpage_problem	$(blockpage_problem)
 blockpage_shown	$([ $loaded = 1 ] && counter_val blockpage_shown)
+dns_flood	$([ $loaded = 1 ] && counter_val dns_flood)
+saved_kb	$([ -f "$SAVED" ] && du -k "$SAVED" | cut -f1)
+flash_free_kb	$(flash_free_kb)
 stats_kb	$(du -sk "$STATS_DIR" 2>/dev/null | cut -f1)
 stats_max_kb	$STATS_MAX_KB
 lan_if	$LAN_IF
@@ -1221,7 +1327,7 @@ case $cmd in
 	dns) cmd_dns "$@";;
 	blockpage) cmd_blockpage "$@";;
 	flush) cmd_flush "$@";;
-	save) cmd_save;;
+	save) cmd_save "$@";;
 	tick) cmd_tick;;
 	prepare) cmd_prepare;;
 	restart) [ "$(base_mode)" = off ] && die "фильтр выключен (kidsctl mode learn|enforce)"; apply; echo "Фильтр перезапущен.";;

@@ -42,7 +42,11 @@ return view.extend({
 				[ 'Заблокировано соединений', st.fwd_blocked || 0 ],
 				[ 'Отклонено обращений к роутеру', st.router_blocked || 0 ],
 				[ 'Показано страниц блокировки', st.blockpage_shown || 0 ]);
+		if (+st.dns_flood > 0)
+			rows.push([ 'Отброшено DNS-запросов (слишком часто)', st.dns_flood ]);
 		rows.push([ 'Статистика в памяти', st.stats_kb + ' из ' + st.stats_max_kb + ' КБ' ]);
+		rows.push([ 'Копия статистики на флеше', (st.saved_kb || 0) + ' КБ' +
+			(st.flash_free_kb ? ' (свободно на флеше ' + st.flash_free_kb + ' КБ)' : '') ]);
 
 		return E('table', { 'class': 'table' }, rows.map(function(r) {
 			return E('tr', { 'class': 'tr' }, [

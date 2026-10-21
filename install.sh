@@ -208,7 +208,7 @@ sed -i '/\/usr\/bin\/kidsctl /d' /etc/crontabs/root
 cat >> /etc/crontabs/root <<'EOF'
 * * * * * /usr/bin/kidsctl tick
 */10 * * * * /usr/bin/kidsctl flush try
-30 3 * * * /usr/bin/kidsctl save
+30 3 * * * /usr/bin/kidsctl save nightly
 EOF
 /etc/init.d/cron enable
 /etc/init.d/cron restart
