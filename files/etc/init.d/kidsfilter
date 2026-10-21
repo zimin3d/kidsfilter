@@ -1,0 +1,38 @@
+#!/bin/sh /etc/rc.common
+# Фильтр «белый список» для детских компьютеров. Управление: kidsctl или LuCI → Службы → Детский фильтр
+
+START=25
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	[ "$(/usr/bin/kidsctl effmode)" = off ] && return 0
+	/usr/bin/kidsctl prepare || return 1
+
+	procd_open_instance
+	procd_set_param command /usr/sbin/dnsmasq -k -C /var/run/kidsfilter/dnsmasq.conf
+	# перезапуск без ограничения числа попыток (раз в 5 с): без детского DNS дети остаются без интернета
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+
+	# страница «Сайт закрыт» (только в enforce): отдельный uhttpd, отдаёт index.html на любой адрес
+	listen=$(/usr/bin/kidsctl blockpage --listen)
+	[ -n "$listen" ] || return 0
+	procd_open_instance blockpage
+	procd_set_param command /usr/sbin/uhttpd -f -h /var/run/kidsfilter/blockpage -E /index.html -T 10
+	for l in $listen; do procd_append_param command -p "$l"; done
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+# при перезагрузке роутера сохранить статистику за день на флеш
+shutdown() {
+	/usr/bin/kidsctl save
+	stop
+}
+
+# Примечание: при остановке сервиса таблица nftables остаётся, и DNS детей
+# перестаёт работать (безопасный отказ). Чтобы действительно выключить
+# фильтр, используйте «kidsctl mode off».

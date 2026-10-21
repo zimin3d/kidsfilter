@@ -1,0 +1,45 @@
+# Белый список. Одна запись в строке; домен разрешает и все поддомены.
+# Можно указывать IPv4/IPv6-адреса и сети (1.2.3.0/24) — для программ, которые ходят мимо DNS.
+# Управлять удобнее командами: kidsctl allow / deny / pending
+
+# --- Windows: проверка подключения, время, вход в учётную запись ---
+msftconnecttest.com
+msftncsi.com
+time.windows.com
+login.live.com
+login.microsoftonline.com
+
+# --- Windows Update и Защитник ---
+windowsupdate.com
+update.microsoft.com
+delivery.mp.microsoft.com
+download.windowsupdate.com
+definitionupdates.microsoft.com
+wdcp.microsoft.com
+wdcpalt.microsoft.com
+smartscreen.microsoft.com
+smartscreen-prod.microsoft.com
+
+# --- Проверка HTTPS-сертификатов (OCSP/CRL), без них сайты могут открываться медленно ---
+digicert.com
+pki.goog
+lencr.org
+sectigo.com
+usertrust.com
+globalsign.com
+comodoca.com
+
+# --- Браузеры: проверка captive portal ---
+detectportal.firefox.com
+connectivitycheck.gstatic.com
+captive.apple.com
+
+# --- Примеры (раскомментируйте нужное) ---
+# ya.ru
+# yandex.ru
+# yastatic.net
+# wikipedia.org
+# wikimedia.org
+# uchi.ru
+# resh.edu.ru
+# gosuslugi.ru

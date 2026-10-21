@@ -1,0 +1,1232 @@
+#!/bin/sh
+# kidsctl — белый список сайтов для детских компьютеров (OpenWrt 22.03+, nftables, dnsmasq-full)
+#
+# Как это работает:
+#  * компьютеры детей определяются по MAC-адресу (файл kids.list);
+#  * весь их DNS (порт 53) принудительно заворачивается на отдельный dnsmasq (порт DNS_PORT);
+#  * этот dnsmasq отвечает только на домены из белого списка, остальное — NXDOMAIN,
+#    а IP-адреса разрешённых доменов складывает в nft-наборы allow4/allow6;
+#  * в режиме enforce ребёнку разрешены соединения только к адресам из этих наборов;
+#  * все DNS-запросы детей пишутся в лог и сводятся в статистику.
+#
+# Безопасность для роутера:
+#  * правила живут в отдельной таблице inet kidsfilter — firewall4 и его конфиг не трогаются;
+#  * правила проверяются (nft -c) до загрузки, загрузка атомарная;
+#  * основной dnsmasq не меняется, детский работает на отдельном порту;
+#  * блокировки с защитой от «зависших» процессов, cron-задачи не копятся;
+#  * объём статистики и логов в RAM ограничен.
+
+VERSION=2.0
+CONF_DIR=/etc/kidsfilter
+# рабочие файлы в RAM (/var/run = /tmp/run); не /tmp/kidsfilter — туда обычно копируют установщик
+RUN_DIR=/var/run/kidsfilter
+OLD_RUN_DIR=/tmp/kidsfilter
+LAN_IF=br-lan
+DNS_PORT=5300
+BLOCK_PORT=5380
+KEEP_DAYS=30
+STATS_MAX_KB=
+LOG_MAX_KB=2048
+[ -f "$CONF_DIR/kidsfilter.conf" ] && . "$CONF_DIR/kidsfilter.conf"
+
+# предел статистики в RAM: 1/32 памяти, но не больше 8 МБ
+if [ -z "$STATS_MAX_KB" ]; then
+	STATS_MAX_KB=$(awk '/^MemTotal:/ { v = int($2 / 32); if (v > 8192) v = 8192; if (v < 512) v = 512; print v }' /proc/meminfo 2>/dev/null)
+	: "${STATS_MAX_KB:=2048}"
+fi
+
+WL="$CONF_DIR/whitelist.txt"
+KIDS="$CONF_DIR/kids.list"
+MODE_FILE="$CONF_DIR/mode"
+DNS_FILE="$CONF_DIR/dns"
+BLOCK_FILE="$CONF_DIR/blockpage"
+BLOCK_SRC=/usr/share/kidsfilter/blocked.html
+BLOCK_DIR="$RUN_DIR/blockpage"
+SAVED="$CONF_DIR/stats.tsv.gz"
+OPEN_FILE="$RUN_DIR/open_until"
+DNS_CONF="$RUN_DIR/dnsmasq.conf"
+DNS_LOG="$RUN_DIR/dns.log"
+NFT_RULES="$RUN_DIR/kidsfilter.nft"
+STATS_DIR="$RUN_DIR/stats"
+RECENT="$RUN_DIR/recent"
+WL_CACHE="$RUN_DIR/wl"
+IPMAP="$RUN_DIR/ipmap"
+RESOLVED="$RUN_DIR/resolved"
+PID_FILE=/var/run/kidsfilter-dns.pid
+INIT=/etc/init.d/kidsfilter
+TABLE="inet kidsfilter"
+
+# грубая форма адреса (отличить IP от домена); точная проверка — ip_filter
+RE_IP4='^[0-9]{1,3}(\.[0-9]{1,3}){3}(/[0-9]{1,2})?$'
+RE_IP6='^[0-9a-f:]*:[0-9a-f:]*(/[0-9]{1,3})?$'
+RE_DOMAIN='^([a-z0-9_]([a-z0-9_-]*[a-z0-9_])?\.)+[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+RE_MAC='^([0-9a-f]{2}:){5}[0-9a-f]{2}$'
+TAB=$(printf '\t')
+NL='
+'
+
+# готовые DNS-серверы с семейным фильтром: имя|серверы|описание
+DNS_PRESETS='yandex|77.88.8.7 77.88.8.3|Яндекс DNS «Семейный»
+cloudflare|1.1.1.3 1.0.0.3|Cloudflare for Families
+adguard|94.140.14.15 94.140.15.16|AdGuard DNS «Семейный»'
+
+# общие awk-функции: проверка домена по белому списку и «базовый» домен (example.com, example.co.uk)
+AWK_LIB='
+function allowed(d,  s, p) {
+	s = d
+	while (1) {
+		if (s in wl) return 1
+		p = index(s, ".")
+		if (!p) return 0
+		s = substr(s, p + 1)
+	}
+}
+function base(d,  n, p) {
+	n = split(d, p, ".")
+	if (n <= 2) return d
+	if (length(p[n]) == 2 && p[n-1] ~ /^(com|net|org|gov|edu|ac|co|msk|spb)$/)
+		return p[n-2] "." p[n-1] "." p[n]
+	return p[n-1] "." p[n]
+}
+'
+
+# norm_ip(): IPv6 в полную форму «2001:db8:0:0:0:0:0:1» (как в /proc/net/tcp6), IPv4 без изменений
+AWK_IP='
+function h2d(x,  i, v) { v = 0; x = tolower(x)
+	for (i = 1; i <= length(x); i++) v = v * 16 + index("0123456789abcdef", substr(x, i, 1)) - 1
+	return v }
+function norm_ip(a,  k, h, t, n, m, ha, ta, g, i, out) {
+	if (!index(a, ":")) return a
+	sub(/%.*/, "", a); a = tolower(a)
+	k = index(a, "::")
+	if (k) { h = substr(a, 1, k - 1); t = substr(a, k + 2) } else { h = a; t = "" }
+	n = (h == "") ? 0 : split(h, ha, ":"); m = (t == "") ? 0 : split(t, ta, ":")
+	for (i = 1; i <= 8; i++) g[i] = 0
+	for (i = 1; i <= n; i++) g[i] = h2d(ha[i])
+	for (i = 1; i <= m; i++) g[8 - m + i] = h2d(ta[i])
+	out = ""
+	for (i = 1; i <= 8; i++) { if (i > 1) out = out ":"; out = out sprintf("%x", g[i]) }
+	return out }
+'
+
+# Строгая проверка IP/сетей: печатает только верные адреса в виде, который примет nft
+# (у сети обнуляются биты хоста: 1.2.3.4/24 -> 1.2.3.0/24). Ввод — по строке, без заглавных.
+# ip_filter 4 | 6 | any [noprefix]
+ip_filter() {
+	# без «^»: busybox awk бывает собран без математики
+	awk -v want="$1" -v nopfx="$2" '
+	function pow2(n,  v) { v = 1; while (n-- > 0) v *= 2; return v }
+	function pfx(s, max,  p) {
+		P = ""; A = s
+		if (!index(s, "/")) return 1
+		if (nopfx != "") return 0
+		p = substr(s, index(s, "/") + 1); A = substr(s, 1, index(s, "/") - 1)
+		if (p !~ /^[0-9]+$/ || length(p) > 3 || p + 0 > max) return 0
+		P = p + 0; return 1
+	}
+	function ip4(s,  a, i, b) {
+		if (!pfx(s, 32) || A !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return ""
+		split(A, a, ".")
+		for (i = 1; i <= 4; i++) {
+			if (length(a[i]) > 3 || a[i] + 0 > 255) return ""
+			a[i] += 0
+			if (P != "") { b = P - (i - 1) * 8; if (b < 0) b = 0; if (b < 8) a[i] -= a[i] % pow2(8 - b) }
+		}
+		return a[1] "." a[2] "." a[3] "." a[4] (P == "" ? "" : "/" P)
+	}
+	function hex(x,  i, v) {
+		v = 0
+		for (i = 1; i <= length(x); i++) v = v * 16 + index("0123456789abcdef", substr(x, i, 1)) - 1
+		return v
+	}
+	function ip6(s,  k, h, t, n, m, ha, ta, g, i, b, out) {
+		if (!pfx(s, 128) || A !~ /^[0-9a-f:]+$/) return ""
+		k = index(A, "::")
+		if (k) { h = substr(A, 1, k - 1); t = substr(A, k + 2); if (index(t, "::")) return "" }
+		else { h = A; t = "" }
+		n = (h == "") ? 0 : split(h, ha, ":")
+		m = (t == "") ? 0 : split(t, ta, ":")
+		if (k ? n + m > 7 : n != 8) return ""
+		for (i = 1; i <= 8; i++) g[i] = 0
+		for (i = 1; i <= n; i++) { if (ha[i] !~ /^[0-9a-f]+$/ || length(ha[i]) > 4) return ""; g[i] = hex(ha[i]) }
+		for (i = 1; i <= m; i++) { if (ta[i] !~ /^[0-9a-f]+$/ || length(ta[i]) > 4) return ""; g[8 - m + i] = hex(ta[i]) }
+		out = ""
+		for (i = 1; i <= 8; i++) {
+			if (P != "") { b = P - (i - 1) * 16; if (b < 0) b = 0; if (b < 16) g[i] -= g[i] % pow2(16 - b) }
+			# не «out (...)»: busybox awk принял бы это за вызов функции out()
+			if (i > 1) out = out ":"
+			out = out sprintf("%x", g[i])
+		}
+		# самая длинная серия нулевых групп -> «::» (как пишут обычно; nft принимает оба вида)
+		n = split(out, g, ":"); bs = 0; bl = 0; cs = 0; cl = 0
+		for (i = 1; i <= n; i++) {
+			if (g[i] == "0") { if (!cl) cs = i; cl++; if (cl > bl) { bl = cl; bs = cs } }
+			else cl = 0
+		}
+		if (bl >= 2) {
+			out = ""
+			for (i = 1; i < bs; i++) { if (i > 1) out = out ":"; out = out g[i] }
+			out = out "::"
+			for (i = bs + bl; i <= n; i++) { out = out g[i]; if (i < n) out = out ":" }
+		}
+		if (P != "") out = out "/" P
+		return out
+	}
+	{ r = ""
+	  if (index($0, ":")) { if (want != 4) r = ip6($0) }
+	  else if (want != 6) r = ip4($0)
+	  if (r != "") print r }'
+}
+
+die() { echo "Ошибка: $*" >&2; exit 1; }
+join_comma() { tr '\n' ',' | sed -e 's/,$//' -e 's/,/, /g'; }
+is_num() { case $1 in ''|*[!0-9]*) return 1;; esac; }
+date_ago() { date -d "@$(( $(date +%s) - $1 * 86400 ))" +%F; }
+# первая строка файла — число (0, если файла нет или там мусор)
+read_num() { v=$(head -n 1 "$1" 2>/dev/null); is_num "$v" && echo "$v" || echo 0; }
+
+# ---------- блокировки ----------
+# Каталог-замок с PID владельца: замок умершего процесса снимается автоматически,
+# поэтому прерванная команда (kill, тайм-аут rpcd) не оставляет вечную блокировку.
+
+HELD_LOCKS=
+release_locks() {
+	for l in $HELD_LOCKS; do
+		[ "$(cat "$l/pid" 2>/dev/null)" = $$ ] && rm -rf "$l"
+	done
+	HELD_LOCKS=
+}
+trap release_locks EXIT
+trap 'release_locks; exit 1' INT TERM HUP
+
+# take_lock <имя> [ждать_секунд]; 0 секунд — только попытка (для cron)
+take_lock() {
+	l="$RUN_DIR/$1.lock"; w=${2:-60}; n=0
+	mkdir -p "$RUN_DIR"
+	while ! mkdir "$l" 2>/dev/null; do
+		p=$(cat "$l/pid" 2>/dev/null)
+		if [ -n "$p" ] && ! kill -0 "$p" 2>/dev/null; then rm -rf "$l"; continue; fi
+		# замок без PID дольше 5 с (владелец убит между mkdir и записью PID)
+		if [ -z "$p" ] && [ $n -ge 5 ]; then rm -rf "$l"; continue; fi
+		[ $n -ge "$w" ] && return 1
+		n=$((n + 1)); sleep 1
+	done
+	echo $$ > "$l/pid"
+	HELD_LOCKS="$HELD_LOCKS $l"
+}
+drop_lock() {
+	l="$RUN_DIR/$1.lock"
+	[ "$(cat "$l/pid" 2>/dev/null)" = $$ ] && rm -rf "$l"
+	HELD_LOCKS=$(echo "$HELD_LOCKS" | sed "s#$l##")
+}
+
+# ---------- белый список ----------
+
+wl_entries() {
+	[ -f "$WL" ] || return 0
+	sed -e 's/#.*//' -e 's/[[:space:]]//g' "$WL" | tr 'A-Z' 'a-z' | grep -v '^$' | sort -u
+}
+wl_domains() { wl_entries | grep -vE "$RE_IP4" | grep -E "$RE_DOMAIN"; }
+# неверные IP в файле пропускаются, чтобы одна ошибка не ломала загрузку правил
+wl_ip4() { wl_entries | ip_filter 4 | sort -u; }
+wl_ip6() { wl_entries | ip_filter 6 | sort -u; }
+refresh_wl() { mkdir -p "$RUN_DIR"; wl_domains > "$WL_CACHE"; }
+
+# приводит «https://www.Example.com:8080/path» и «*.example.com» к «www.example.com» / «example.com»
+norm() {
+	if printf '%s\n' "$1" | tr 'A-Z' 'a-z' | grep -qE "$RE_IP4|$RE_IP6"; then
+		printf '%s\n' "$1" | tr 'A-Z' 'a-z'
+		return
+	fi
+	printf '%s\n' "$1" | tr 'A-Z' 'a-z' | sed \
+		-e 's#^[a-z][a-z0-9+.-]*://##' -e 's#[/?].*$##' -e 's#^[^@]*@##' \
+		-e 's/^\[\([0-9a-f:]*\)\].*/\1/' -e '/^[^:]*:[0-9]*$/s/:[0-9]*$//' \
+		-e 's/^\*\.//' -e 's/^\.//' -e 's/\.$//'
+}
+
+valid_entry() {
+	case $1 in ''|*"$NL"*) return 1;; esac
+	[ -n "$(printf '%s\n' "$1" | ip_filter any)" ] && return 0
+	printf '%s\n' "$1" | grep -vE "$RE_IP4" | grep -qE "$RE_DOMAIN"
+}
+
+# запись или её родительский домен уже есть в списке (список — в файле $RUN_DIR/wl.all)
+covered_by() {
+	awk -v d="$1" '
+		{ have[$0] = 1 }
+		END { s = d
+			while (1) {
+				if (s in have) { print s; exit 0 }
+				p = index(s, "."); if (!p) exit 1
+				s = substr(s, p + 1) } }' "$RUN_DIR/wl.all"
+}
+
+# ---------- дети ----------
+
+kid_list() {
+	[ -f "$KIDS" ] || return 0
+	sed 's/#.*//' "$KIDS" | awk 'NF >= 2 { print $1, tolower($2) }'
+}
+kid_macs() { kid_list | awk '{ print $2 }' | grep -E "$RE_MAC" | sort -u; }
+
+# соседи роутера: «ip mac» (ARP/NDP, кроме несостоявшихся)
+neigh_pairs() {
+	{ ip -4 neigh show; ip -6 neigh show; } 2>/dev/null | awk '
+		$NF ~ /FAILED|INCOMPLETE/ { next }
+		{ for (i = 2; i < NF; i++) if ($i == "lladdr") print $1, tolower($(i+1)) }'
+}
+
+# текущие IP детей: «ip имя» (из DHCP-аренд и таблицы соседей)
+ip_map() {
+	{
+		[ -f /tmp/dhcp.leases ] && awk '{ print $3, tolower($2) }' /tmp/dhcp.leases
+		neigh_pairs
+	} | awk -v K="$RUN_DIR/ipmap.kids" '
+		FILENAME == K { kid[$2] = $1; next }
+		($2 in kid) { print $1, kid[$2] }' "$RUN_DIR/ipmap.kids" - 2>/dev/null | sort -u
+}
+refresh_ipmap() { mkdir -p "$RUN_DIR"; kid_list > "$RUN_DIR/ipmap.kids"; ip_map > "$IPMAP"; }
+
+# IP-адреса, с которых сейчас открыто управление роутером (веб-интерфейс или SSH).
+# Берётся из сокетов самого роутера (/proc/net/tcp*), поэтому не зависит от conntrack.
+admin_ips() {
+	cat /proc/net/tcp /proc/net/tcp6 2>/dev/null | awk "$AWK_IP"'
+	# адрес из /proc/net/tcp: 4 байта в обратном порядке (little-endian)
+	function v4(x) { return h2d(substr(x, 7, 2)) "." h2d(substr(x, 5, 2)) "." h2d(substr(x, 3, 2)) "." h2d(substr(x, 1, 2)) }
+	function v6(x,  i, w, out) { out = ""
+		for (i = 0; i < 4; i++) { w = substr(x, i * 8 + 1, 8)
+			w = substr(w, 7, 2) substr(w, 5, 2) substr(w, 3, 2) substr(w, 1, 2)
+			out = out (i ? ":" : "") sprintf("%x:%x", h2d(substr(w, 1, 4)), h2d(substr(w, 5, 4))) }
+		return out }
+	$4 == "01" {
+		split($2, l, ":"); split($3, r, ":")
+		port = h2d(l[2])
+		if (port != 22 && port != 80 && port != 443) next
+		a = r[1]
+		if (length(a) == 8) print v4(a)
+		else if (toupper(substr(a, 1, 24)) == "0000000000000000FFFF0000") print v4(substr(a, 25, 8))
+		else print v6(a) }' | sort -u
+}
+
+# ---------- DNS для детей ----------
+
+dns_list() { [ -f "$DNS_FILE" ] && tr ',' ' ' < "$DNS_FILE" | xargs; }
+
+# серверы, через которые детский dnsmasq разрешает имена (по умолчанию — DNS роутера)
+dns_upstreams() {
+	u=$(dns_list)
+	echo "${u:-127.0.0.1}"
+}
+
+dns_label() {
+	u=$(dns_list)
+	[ -n "$u" ] || { echo "DNS роутера"; return; }
+	p=$(printf '%s\n' "$DNS_PRESETS" | awk -F '|' -v u="$u" '$2 == u { print $3 }')
+	echo "${p:+$p: }$u"
+}
+
+# ---------- страница блокировки ----------
+# В enforce запрещённые домены получают в ответ адрес роутера, а HTTP-запросы детей к любым
+# неразрешённым адресам перенаправляются на отдельный uhttpd (порт BLOCK_PORT) со страницей «Сайт закрыт».
+
+blockpage_on() { [ "$(cat "$BLOCK_FILE" 2>/dev/null)" != off ]; }
+
+# IPv4-адреса LAN-интерфейсов (на них слушает сервер страницы)
+lan_ip4s() {
+	for i in $LAN_IF; do ip -4 -o addr show dev "$i" 2>/dev/null; done |
+		awk '{ for (j = 1; j < NF; j++) if ($j == "inet") { sub(/\/.*/, "", $(j+1)); print $(j+1) } }'
+}
+
+# почему страница не показывается (пусто — показывается)
+blockpage_problem() {
+	blockpage_on || { echo "выключена"; return; }
+	[ -x /usr/sbin/uhttpd ] || { echo "нет uhttpd (opkg install uhttpd)"; return; }
+	[ -n "$(lan_ip4s)" ] || echo "у LAN ($LAN_IF) нет IPv4-адреса"
+}
+blockpage_active() { [ -z "$(blockpage_problem)" ]; }
+
+# для init-скрипта: адреса «ip:порт» для uhttpd (пусто — сервер не нужен)
+blockpage_listen() {
+	[ "$(eff_mode)" = enforce ] && blockpage_active || return 0
+	lan_ip4s | awk -v p="$BLOCK_PORT" '{ print $1 ":" p }'
+}
+
+# ---------- режим ----------
+
+base_mode() {
+	m=$(cat "$MODE_FILE" 2>/dev/null)
+	case $m in enforce|learn|off) echo "$m";; *) echo learn;; esac
+}
+
+# фактический режим с учётом временного открытия («kidsctl open»)
+eff_mode() {
+	m=$(base_mode)
+	if [ "$m" = enforce ] && [ "$(date +%s)" -lt "$(read_num "$OPEN_FILE")" ]; then
+		m=learn
+	fi
+	echo "$m"
+}
+
+# ---------- генерация конфигурации ----------
+
+gen_nft() {
+	m=$1
+	macs=$(kid_macs | join_comma)
+	s4=$(wl_ip4 | join_comma)
+	s6=$(wl_ip6 | join_comma)
+	lan=$(for i in $LAN_IF; do printf '"%s"\n' "$i"; done | join_comma)
+	bp=0; [ "$m" = enforce ] && blockpage_active && bp=1
+
+	# Отдельная таблица: перезагрузка fw4 её не трогает, наборы allow4/allow6 при смене режима сохраняются.
+	cat <<EOF
+table $TABLE {
+	set kids_mac { type ether_addr; }
+	set allow4 { type ipv4_addr; }
+	set allow6 { type ipv6_addr; }
+	set static4 { type ipv4_addr; flags interval; auto-merge; }
+	set static6 { type ipv6_addr; flags interval; auto-merge; }
+	counter dns_redirected { }
+	counter fwd_blocked { }
+	counter router_blocked { }
+	counter blockpage_shown { }
+	chain dstnat { type nat hook prerouting priority dstnat - 5; policy accept; }
+	chain input { type filter hook input priority filter - 5; policy accept; }
+	chain forward { type filter hook forward priority filter - 5; policy accept; }
+}
+flush set $TABLE kids_mac
+flush set $TABLE static4
+flush set $TABLE static6
+flush chain $TABLE dstnat
+flush chain $TABLE input
+flush chain $TABLE forward
+EOF
+	[ -n "$macs" ] && echo "add element $TABLE kids_mac { $macs }"
+	[ -n "$s4" ] && echo "add element $TABLE static4 { $s4 }"
+	[ -n "$s6" ] && echo "add element $TABLE static6 { $s6 }"
+
+	# Сначала всё, что пришло не с LAN, пропускаем без проверок: у пакетов с lo, PPPoE, туннелей
+	# нет Ethernet-заголовка, и проверка «ether saddr» для них не срабатывает ни в одну сторону.
+	cat <<EOF
+add rule $TABLE dstnat iifname { $lan } ether saddr @kids_mac meta l4proto { tcp, udp } th dport 53 counter name dns_redirected redirect to :$DNS_PORT
+EOF
+	# HTTP к неразрешённым адресам (и к роутеру, куда DNS отправляет запрещённые домены) — на страницу блокировки.
+	# В nat-цепочку попадает только первый пакет соединения, поэтому счётчик считает соединения.
+	[ $bp = 1 ] && echo "add rule $TABLE dstnat iifname { $lan } ether saddr @kids_mac tcp dport 80 ip daddr != @allow4 ip daddr != @static4 counter name blockpage_shown redirect to :$BLOCK_PORT"
+	cat <<EOF
+add rule $TABLE input iifname != { $lan } return
+add rule $TABLE input ether saddr != @kids_mac return
+add rule $TABLE input meta l4proto { tcp, udp } th dport $DNS_PORT accept
+add rule $TABLE input udp dport { 67, 547 } accept
+add rule $TABLE input meta l4proto { icmp, ipv6-icmp } accept
+EOF
+	[ $bp = 1 ] && echo "add rule $TABLE input tcp dport $BLOCK_PORT accept"
+	# TCP — сразу отказ, а не молчание: на https://запрещённый-сайт браузер не ждёт тайм-аута
+	cat <<EOF
+add rule $TABLE input meta l4proto tcp counter name router_blocked reject with tcp reset
+add rule $TABLE input counter name router_blocked drop
+EOF
+	[ "$m" = enforce ] || return 0
+	cat <<EOF
+add rule $TABLE forward iifname != { $lan } return
+add rule $TABLE forward ether saddr != @kids_mac return
+add rule $TABLE forward ip daddr @allow4 return
+add rule $TABLE forward ip6 daddr @allow6 return
+add rule $TABLE forward ip daddr @static4 return
+add rule $TABLE forward ip6 daddr @static6 return
+add rule $TABLE forward limit rate 10/minute log prefix "kidsfilter-drop: " level info
+add rule $TABLE forward meta l4proto tcp counter name fwd_blocked reject with tcp reset
+add rule $TABLE forward counter name fwd_blocked reject with icmpx admin-prohibited
+EOF
+}
+
+gen_dnsmasq() {
+	m=$1
+	cat <<EOF
+# сгенерировано kidsctl — не редактировать
+port=$DNS_PORT
+bind-dynamic
+pid-file=$PID_FILE
+user=root
+no-resolv
+no-hosts
+domain-needed
+bogus-priv
+# без кэша: каждый ответ проходит через nftset (кэширует основной dnsmasq)
+cache-size=0
+max-ttl=300
+log-queries=extra
+log-async=50
+log-facility=$DNS_LOG
+EOF
+	for i in $LAN_IF; do echo "interface=$i"; done
+	# одним awk на весь список: при сотнях доменов это в десятки раз быстрее цикла в shell
+	# запрещённые домены: со страницей блокировки — адрес роутера, без неё — «домен не существует»
+	bip=
+	[ "$m" = enforce ] && blockpage_active && bip=$(lan_ip4s | head -n 1)
+	wl_domains | awk -v mode="$m" -v ups="$(dns_upstreams)" -v bip="$bip" '
+		BEGIN { n = split(ups, u, " ")
+			if (mode == "enforce") print "address=/#/" bip
+			else {
+				for (i = 1; i <= n; i++) print "server=" u[i]
+				# сигнал Firefox не включать DNS-over-HTTPS
+				print "address=/use-application-dns.net/"
+			} }
+		{
+			if (mode == "enforce") for (i = 1; i <= n; i++) print "server=/" $0 "/" u[i]
+			# наборы наполняются и в learn: после закрытия «open» разрешённые сайты сразу работают
+			print "nftset=/" $0 "/4#inet#kidsfilter#allow4,6#inet#kidsfilter#allow6"
+		}'
+}
+
+# вызывается из /etc/init.d/kidsfilter при старте
+cmd_prepare() {
+	mkdir -p "$RUN_DIR"
+	load_stats
+	m=$(eff_mode)
+	if [ "$m" = off ]; then
+		nft delete table $TABLE 2>/dev/null
+		return 0
+	fi
+	for i in $LAN_IF; do
+		ip link show dev "$i" >/dev/null 2>&1 || logger -t kidsfilter "интерфейс $i не найден (LAN_IF в $CONF_DIR/kidsfilter.conf)"
+	done
+	gen_nft "$m" > "$NFT_RULES"
+	if ! nft -c -f "$NFT_RULES" 2>/dev/null || ! nft -f "$NFT_RULES" 2>/dev/null; then
+		# таблица от старой версии (другие флаги наборов) — пересоздаём
+		nft delete table $TABLE 2>/dev/null
+		rm -f "$RESOLVED"
+		if ! nft -f "$NFT_RULES"; then
+			logger -t kidsfilter "правила nftables не загружены ($NFT_RULES)"
+			die "не удалось загрузить правила nftables ($NFT_RULES)"
+		fi
+	fi
+	gen_dnsmasq "$m" > "$DNS_CONF"
+	# страница блокировки (своя версия — /etc/kidsfilter/blocked.html)
+	mkdir -p "$BLOCK_DIR"
+	page=$BLOCK_SRC; [ -f "$CONF_DIR/blocked.html" ] && page=$CONF_DIR/blocked.html
+	cp "$page" "$BLOCK_DIR/index.html" 2>/dev/null ||
+		echo '<!doctype html><meta charset="utf-8"><title>Сайт закрыт</title><h1>Этот сайт закрыт детским фильтром</h1>' > "$BLOCK_DIR/index.html"
+	if ! dnsmasq --test -C "$DNS_CONF" >/dev/null 2>&1; then
+		logger -t kidsfilter "конфигурация dnsmasq не прошла проверку ($DNS_CONF)"
+		die "конфигурация dnsmasq не прошла проверку ($DNS_CONF)"
+	fi
+}
+
+# применить настройки: перезапуск сервиса (по одному за раз)
+apply() {
+	take_lock apply 120 || die "другая операция с фильтром выполняется слишком долго"
+	# stop + start вместо restart: restart незапущенной службы печатает ошибку procd
+	"$INIT" stop >/dev/null 2>&1
+	"$INIT" start
+	drop_lock apply
+}
+
+# убирает из allow4/allow6 адреса, полученные для удалённого домена (и его поддоменов),
+# если их не вернул ещё какой-то из оставшихся разрешённых доменов
+drop_resolved() {
+	[ -s "$RESOLVED" ] || return 0
+	refresh_wl
+	awk -F '\t' -v d="$1" -v WLF="$WL_CACHE" "$AWK_LIB"'
+		FILENAME == WLF { wl[$1] = 1; next }
+		{ if (($2 == d || substr($2, length($2) - length(d)) == "." d) && !allowed($2)) drop[$1] = 1
+		  else if (allowed($2)) keep[$1] = 1 }
+		END { for (ip in drop) if (!(ip in keep)) print ip }
+	' "$WL_CACHE" "$RESOLVED" | while read -r ip; do
+		case $ip in *:*) nft delete element $TABLE allow6 "{ $ip }";; *) nft delete element $TABLE allow4 "{ $ip }";; esac
+	done 2>/dev/null
+	awk -F '\t' -v WLF="$WL_CACHE" "$AWK_LIB"'
+		FILENAME == WLF { wl[$1] = 1; next }
+		allowed($2)' "$WL_CACHE" "$RESOLVED" > "$RESOLVED.new" && mv "$RESOLVED.new" "$RESOLVED"
+}
+
+# ---------- лог и статистика ----------
+#
+# Статистика хранится по дням: $STATS_DIR/ГГГГ-ММ-ДД, строки «дата  час  ребёнок  домен  счётчик» двух видов:
+#   дата  *    ребёнок  домен  N   — запросы к домену за день
+#   дата  чч   ребёнок  *      N   — все запросы ребёнка за час
+# Разбор журнала трогает только файлы затронутых дней, поэтому не зависит от объёма истории.
+# (старый формат «дата чч ребёнок домен N» при загрузке раскладывается в оба вида)
+
+RE_DAY='^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$'
+
+dns_pid() {
+	p=$(read_num "$PID_FILE")
+	[ "$p" -gt 0 ] && kill -0 "$p" 2>/dev/null && { echo "$p"; return 0; }
+	pgrep -f "$DNS_CONF" 2>/dev/null | head -n 1
+}
+
+# строки журнала с запросами A (grep намного быстрее awk, отсекает ответы и служебные строки)
+# формат log-queries=extra: «Mon DD HH:MM:SS dnsmasq[pid]: N ip/port query[A] домен from ip»
+log_queries() { grep -F ' query[A] ' "$1"; }
+
+# журнал -> строки статистики (с датой)
+parse_log() {
+	# в логе нет года: месяц позже текущего — это прошлый год (запись от 31 декабря, разобранная 1 января)
+	log_queries "$1" | awk -v Y="$(date +%Y)" -v CM="$(date +%m)" -v MAPF="$IPMAP" '
+	BEGIN { split("Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec", m, " ")
+		for (i = 1; i <= 12; i++) mon[m[i]] = sprintf("%02d", i) }
+	FILENAME == MAPF { name[$1] = $2; next }
+	$7 == "query[A]" && $9 == "from" {
+		d = tolower($8); sub(/\.$/, "", d)
+		if (d !~ /^[a-z0-9_-]+(\.[a-z0-9_-]+)+$/) next
+		k = ($10 in name) ? name[$10] : $10
+		if (!($1 in day)) day[$1] = (mon[$1] + 0 > CM + 0 ? Y - 1 : Y) "-" mon[$1]
+		dt = day[$1] "-" sprintf("%02d", $2)
+		n[dt "\t*\t" k "\t" d]++
+		n[dt "\t" substr($3, 1, 2) "\t" k "\t*"]++
+	}
+	END { for (x in n) print x "\t" n[x] }
+	' "$IPMAP" -
+}
+
+# последние N запросов для «живого» журнала: «время  ребёнок  домен»
+parse_recent() {
+	log_queries "$1" | tail -n "$2" | awk -v MAPF="$IPMAP" '
+	FILENAME == MAPF { name[$1] = $2; next }
+	$7 == "query[A]" && $9 == "from" {
+		d = tolower($8); sub(/\.$/, "", d)
+		if (d !~ /^[a-z0-9_-]+(\.[a-z0-9_-]+)+$/) next
+		print $1 " " $2 " " $3 "\t" (($10 in name) ? name[$10] : $10) "\t" d
+	}' "$IPMAP" -
+}
+
+# пары «IP  разрешённый_домен» — какие адреса попали в allow4/allow6 и из-за какого домена.
+# dnsmasq 2.91+ пишет это сам («nftset add 4 inet kidsfilter allow4 IP домен»),
+# для старых версий — по ответам на запросы к разрешённым доменам (общий номер запроса).
+parse_replies() {
+	# dnsmasq уже писал «nftset add» — достаточно этих строк (быстро)
+	if [ -f "$RUN_DIR/nftset-logged" ] || grep -q -F ' nftset add ' "$1"; then
+		touch "$RUN_DIR/nftset-logged"
+		grep -F ' nftset add ' "$1" | awk '$7 == "nftset" && $8 == "add" { print $(NF-1) "\t" $NF }'
+		return
+	fi
+	grep -F -e ' query[' -e ' reply ' "$1" | awk -v WLF="$WL_CACHE" "$AWK_LIB"'
+	FILENAME == WLF { wl[$1] = 1; next }
+	$7 ~ /^query\[/ {
+		d = tolower($8); sub(/\.$/, "", d)
+		if (!(d in am)) am[d] = allowed(d)
+		if (am[d]) q[$5 " " $6] = d
+		next }
+	$7 == "reply" && (($5 " " $6) in q) && $(NF-1) == "is" && ($NF ~ /^[0-9]+\.[0-9.]+$/ || $NF ~ /^[0-9a-f]*:[0-9a-f:]+$/) {
+		print $NF "\t" q[$5 " " $6]
+	}' "$WL_CACHE" -
+}
+
+stats_days() { ls "$STATS_DIR" 2>/dev/null | grep -E "$RE_DAY"; }
+
+# новые строки статистики (stdin) -> в файлы своих дней
+merge_stats() {
+	mkdir -p "$STATS_DIR"
+	rm -f "$STATS_DIR"/*.new
+	awk -F '\t' -v D="$STATS_DIR" '
+		NF != 5 || $1 !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/ { next }
+		$2 != "*" && $4 != "*" { print $1 "\t*\t" $3 "\t" $4 "\t" $5 > (D "/" $1 ".new")
+			print $1 "\t" $2 "\t" $3 "\t*\t" $5 > (D "/" $1 ".new"); next }
+		{ print > (D "/" $1 ".new") }'
+	for f in "$STATS_DIR"/*.new; do
+		[ -f "$f" ] || continue
+		day=${f%.new}
+		cat "$day" "$f" 2>/dev/null | awk -F '\t' '
+			{ n[$1 "\t" $2 "\t" $3 "\t" $4] += $5 }
+			END { for (k in n) print k "\t" n[k] }' > "$day.tmp" && mv "$day.tmp" "$day"
+		rm -f "$f"
+	done
+	prune_stats
+}
+
+# срок хранения и предел объёма: удаляются самые старые дни (сегодняшний остаётся всегда)
+prune_stats() {
+	cutoff=$(date_ago "$KEEP_DAYS")
+	stats_days | awk -v c="$cutoff" '$0 < c' | while read -r f; do rm -f "$STATS_DIR/$f"; done
+	max=$((STATS_MAX_KB * 1024)); total=0; n=0
+	stats_days | sort -r | while read -r f; do
+		total=$((total + $(wc -c < "$STATS_DIR/$f")))
+		if [ $n -gt 0 ] && [ $total -gt $max ]; then
+			rm -f "$STATS_DIR/$f"
+			logger -t kidsfilter "статистика больше ${STATS_MAX_KB} КБ — удалён день $f"
+		fi
+		n=$((n + 1))
+	done
+}
+
+# загрузка статистики: из сохранённой на флеше копии и от старой версии (один файл stats.tsv)
+load_stats() {
+	# статистика версии 1 (до обновления хранилась в $OLD_RUN_DIR/stats.tsv)
+	if [ -f "$OLD_RUN_DIR/stats.tsv" ] && [ -f "$OLD_RUN_DIR/dnsmasq.conf" ]; then
+		merge_stats < "$OLD_RUN_DIR/stats.tsv" && rm -f "$OLD_RUN_DIR/stats.tsv"
+	fi
+	if [ -z "$(stats_days)" ] && [ -f "$SAVED" ]; then
+		gzip -dc "$SAVED" 2>/dev/null | merge_stats
+	fi
+}
+
+# переносит накопленный лог в статистику (cron, а также перед stats/pending)
+# KIDSCTL_NOFLUSH=1 — пропустить; аргумент try — не ждать, если уже идёт (cron)
+cmd_flush() {
+	[ "$KIDSCTL_NOFLUSH" = 1 ] && return 0
+	if [ "$1" = try ]; then take_lock flush 0 || return 0
+	else take_lock flush 60 || { echo "Предупреждение: статистика обновляется другим процессом" >&2; return 0; }
+	fi
+	# остатки прерванного запуска (kill, тайм-аут) не теряются: всё собирается в dns.work
+	if [ -f "$RUN_DIR/dns.new" ]; then
+		cat "$RUN_DIR/dns.new" >> "$RUN_DIR/dns.work" && rm -f "$RUN_DIR/dns.new"
+	fi
+	if [ -s "$DNS_LOG" ]; then
+		mv "$DNS_LOG" "$RUN_DIR/dns.new"
+		pid=$(dns_pid)
+		[ -n "$pid" ] && kill -USR2 "$pid" 2>/dev/null
+		sleep 1
+		# dnsmasq по SIGUSR2 сразу открывает лог заново; если файла нет — процесс не тот или завис
+		if [ ! -e "$DNS_LOG" ] && [ "$(eff_mode)" != off ]; then
+			logger -t kidsfilter "детский DNS не открыл журнал заново — перезапуск"
+			( "$INIT" restart >/dev/null 2>&1 & )
+		fi
+		cat "$RUN_DIR/dns.new" >> "$RUN_DIR/dns.work" && rm -f "$RUN_DIR/dns.new"
+	fi
+	if [ -s "$RUN_DIR/dns.work" ]; then
+		refresh_ipmap; refresh_wl
+		parse_log "$RUN_DIR/dns.work" | merge_stats
+		{ [ -f "$RECENT" ] && cat "$RECENT"; parse_recent "$RUN_DIR/dns.work" 500; } | tail -n 500 > "$RECENT.new" &&
+			mv "$RECENT.new" "$RECENT"
+		{ [ -f "$RESOLVED" ] && cat "$RESOLVED"; parse_replies "$RUN_DIR/dns.work"; } | sort -u | tail -n 50000 > "$RESOLVED.new" &&
+			mv "$RESOLVED.new" "$RESOLVED"
+	fi
+	rm -f "$RUN_DIR/dns.work"
+	drop_lock flush
+}
+
+# сохраняет статистику на флеш (раз в сутки по cron и при перезагрузке)
+cmd_save() {
+	cmd_flush
+	files=$(stats_days)
+	[ -n "$files" ] || return 0
+	# shellcheck disable=SC2086
+	( cd "$STATS_DIR" && cat $files ) | gzip -c > "$SAVED.tmp" && mv "$SAVED.tmp" "$SAVED"
+}
+
+days_arg() {
+	d=${1:-1}
+	is_num "$d" && [ "$d" -ge 1 ] && [ "$d" -le 366 ] || die "число дней должно быть от 1 до 366"
+	echo "$d"
+}
+
+# строки статистики за последние N дней
+select_rows() {
+	files=$(stats_days | awk -v s="$(date_ago $(( $1 - 1 )))" '$0 >= s')
+	[ -n "$files" ] || return 0
+	# shellcheck disable=SC2086
+	( cd "$STATS_DIR" && cat $files )
+}
+
+cmd_pending() {
+	raw=0
+	[ "$1" = --raw ] && { raw=1; shift; }
+	days=$(days_arg "$1") || exit 1
+	cmd_flush; refresh_wl
+	select_rows "$days" | awk -F '\t' -v WLF="$WL_CACHE" "$AWK_LIB"'
+		FILENAME == WLF { wl[$1] = 1; next }
+		$4 == "*" { next }
+		{ if (!($4 in am)) am[$4] = allowed($4); if (am[$4]) next }
+		{
+			n[$4] += $5
+			if (!(($4, $3) in seen)) { seen[$4, $3] = 1; kl[$4] = kl[$4] (kl[$4] == "" ? "" : ",") $3 }
+		}
+		END { for (d in n) print n[d] "\t" d "\t" base(d) "\t" kl[d] }
+	' "$WL_CACHE" - | sort -nr | head -n 500 > "$RUN_DIR/pending"
+
+	if [ $raw = 1 ]; then cat "$RUN_DIR/pending"; return; fi
+	if [ ! -s "$RUN_DIR/pending" ]; then
+		echo "Нет запросов вне белого списка за последние $days дн."
+		return
+	fi
+	echo "Домены вне белого списка за $days дн. (запросов / домен / кто):"
+	head -n 100 "$RUN_DIR/pending" | awk -F '\t' '{ printf "%7d  %-45s %s\n", $1, $2, $4 }'
+	echo
+	echo "Разрешить:  kidsctl allow <домен>   (разрешает и все поддомены)"
+}
+
+# Статистика одним проходом. Строки:
+#   T ребёнок всего вне_списка | S ребёнок сайт запросов есть_вне_списка (топ-20, по убыванию)
+#   H ребёнок час запросов     | Y ребёнок дата запросов (по возрастанию даты)
+# (busybox sort в OpenWrt не умеет -t/-k: сортируем только по началу строки)
+stats_raw() {
+	select_rows "$1" | awk -F '\t' -v WLF="$WL_CACHE" "$AWK_LIB"'
+		FILENAME == WLF { wl[$1] = 1; next }
+		$4 == "*" { H[$3 "\t" $2] += $5; next }
+		{
+			k = $3; c = $5
+			# allowed/base для каждого домена считаются один раз (строк в десятки раз больше, чем доменов)
+			if (!($4 in am)) { am[$4] = allowed($4); bm[$4] = base($4) }
+			b = bm[$4]; ok = am[$4]
+			T[k] += c; if (!ok) { O[k] += c; SO[k "\t" b] = 1 }
+			S[k "\t" b] += c; Y[k "\t" $1] += c
+		}
+		END {
+			for (k in T) print "T\t" k "\t" T[k] "\t" O[k] + 0
+			for (k in S) print "S\t" k "\t" S[k] "\t" ((k in SO) ? 1 : 0)
+			for (k in H) print "H\t" k "\t" H[k]
+			for (k in Y) print "Y\t" k "\t" Y[k]
+		}' "$WL_CACHE" - > "$RUN_DIR/stats.all"
+	grep '^T' "$RUN_DIR/stats.all"
+	# число в начало строки -> sort -nr -> убрать число, оставить по 20 сайтов на ребёнка
+	grep '^S' "$RUN_DIR/stats.all" | awk -F '\t' '{ print $4 "\t" $0 }' | sort -nr | cut -f2- |
+		awk -F '\t' '{ if (++n[$2] <= 20) print }'
+	grep '^H' "$RUN_DIR/stats.all"
+	grep '^Y' "$RUN_DIR/stats.all" | sort
+	rm -f "$RUN_DIR/stats.all"
+}
+
+cmd_stats() {
+	raw=0
+	[ "$1" = --raw ] && { raw=1; shift; }
+	days=$(days_arg "$1") || exit 1
+	cmd_flush; refresh_wl
+	stats_raw "$days" > "$RUN_DIR/stats.out"
+	if [ $raw = 1 ]; then cat "$RUN_DIR/stats.out"; rm -f "$RUN_DIR/stats.out"; return; fi
+	if [ ! -s "$RUN_DIR/stats.out" ]; then
+		echo "Нет данных за последние $days дн."
+		return
+	fi
+	echo "Статистика за $days дн. (с $(date_ago $(( days - 1 )))), режим: $(eff_mode)"
+	awk -F '\t' -v days="$days" '
+		{ kids[$2] = 1 }
+		$1 == "T" { t[$2] = $3; o[$2] = $4 }
+		$1 == "S" { ns[$2]++; s[$2, ns[$2]] = sprintf("%7d  %s%s", $4, $3, $5 ? "  [есть вне списка]" : "") }
+		$1 == "H" { h[$2, $3] = $4; if ($4 > mx[$2]) mx[$2] = $4 }
+		$1 == "Y" { ny[$2]++; y[$2, ny[$2]] = "  " $3 "  " $4 }
+		END {
+			for (k in kids) {
+				printf "\n=== %s ===\n", k
+				printf "Запросов: %d, вне белого списка: %d (%d%%)\n", t[k], o[k], t[k] ? o[k] * 100 / t[k] : 0
+				print "Топ сайтов:"
+				for (i = 1; i <= ns[k]; i++) print s[k, i]
+				print "Активность по часам:"
+				for (i = 0; i < 24; i++) { hh = sprintf("%02d", i); if (!((k, hh) in h)) continue
+					bar = ""; for (j = 0; j < int(h[k, hh] * 40 / mx[k] + 0.5); j++) bar = bar "#"
+					printf "  %s:00 %-40s %d\n", hh, bar, h[k, hh] }
+				if (days > 1) { print "По дням:"; for (i = 1; i <= ny[k]; i++) print y[k, i] }
+			}
+		}' "$RUN_DIR/stats.out"
+	rm -f "$RUN_DIR/stats.out"
+}
+
+# последние запросы (для веб-интерфейса): «время  ребёнок  домен  в_списке(1/0)»
+cmd_tail() {
+	n=${1:-100}
+	is_num "$n" && [ "$n" -ge 1 ] && [ "$n" -le 500 ] || n=100
+	refresh_wl; refresh_ipmap
+	{
+		[ -f "$RECENT" ] && cat "$RECENT"
+		[ -f "$DNS_LOG" ] && parse_recent "$DNS_LOG" "$n"
+	} | tail -n "$n" | awk -F '\t' -v WLF="$WL_CACHE" "$AWK_LIB"'
+		FILENAME == WLF { wl[$1] = 1; next }
+		{ print $1 "\t" $2 "\t" $3 "\t" (allowed($3) ? 1 : 0) }' "$WL_CACHE" -
+}
+
+# живой просмотр запросов
+cmd_log() {
+	[ -f "$DNS_LOG" ] || : > "$DNS_LOG"
+	refresh_wl; refresh_ipmap
+	echo "Запросы детей в реальном времени (Ctrl+C — выход):"
+	tail -n 20 -F "$DNS_LOG" 2>/dev/null | awk -v WLF="$WL_CACHE" -v MAPF="$IPMAP" "$AWK_LIB"'
+		FILENAME == WLF { wl[$1] = 1; next }
+		FILENAME == MAPF { name[$1] = $2; next }
+		{
+			for (i = 4; i < NF; i++) if ($i == "query[A]") break
+			if (i >= NF - 2 || $i != "query[A]") next
+			d = tolower($(i+1)); c = $(i+3)
+			printf "%s  %-12s %-50s %s\n", $3, (c in name) ? name[c] : c, d, allowed(d) ? "" : "ВНЕ СПИСКА"
+			fflush()
+		}
+	' "$WL_CACHE" "$IPMAP" -
+}
+
+# заблокированные соединения по IP (обычно программы/игры, идущие мимо DNS)
+cmd_blocked() {
+	raw=0
+	[ "$1" = --raw ] && { raw=1; shift; }
+	n=${1:-30}
+	is_num "$n" && [ "$n" -ge 1 ] && [ "$n" -le 500 ] || n=30
+	refresh_ipmap
+	logread 2>/dev/null | grep 'kidsfilter-drop:' | tail -n "$n" | awk -v MAPF="$IPMAP" -v raw="$raw" '
+		FILENAME == MAPF { name[$1] = $2; next }
+		{
+			t = $2 " " $3 " " $4; src = dst = proto = dpt = ""
+			for (i = 5; i <= NF; i++) {
+				if ($i ~ /^SRC=/) src = substr($i, 5)
+				else if ($i ~ /^DST=/) dst = substr($i, 5)
+				else if ($i ~ /^PROTO=/) proto = substr($i, 7)
+				else if ($i ~ /^DPT=/) dpt = substr($i, 5)
+			}
+			if (dst == "") next
+			k = (src in name) ? name[src] : src
+			if (raw) print t "\t" k "\t" dst "\t" dpt "\t" proto
+			else printf "%s  %-12s -> %s%s %s\n", t, k, dst, (dpt == "" ? "" : ":" dpt), proto
+		}' "$IPMAP" -
+}
+
+# ---------- команды управления ----------
+
+cmd_allow() {
+	[ $# -gt 0 ] || die "укажите домен, например: kidsctl allow example.com"
+	[ $# -le 500 ] || die "не больше 500 записей за раз"
+	mkdir -p "$RUN_DIR"
+	wl_entries > "$RUN_DIR/wl.all"
+	added=0
+	for a in "$@"; do
+		d=$(norm "$a")
+		valid_entry "$d" || { echo "пропущено (неверный формат): $a" >&2; continue; }
+		# IP/сеть сохраняем в том виде, в каком она попадёт в правила (1.2.3.4/24 -> 1.2.3.0/24)
+		ip=$(printf '%s\n' "$d" | ip_filter any)
+		[ -n "$ip" ] && d=$ip
+		if c=$(covered_by "$d"); then echo "уже разрешено ($c): $d"; continue; fi
+		[ -s "$WL" ] && [ -n "$(tail -c 1 "$WL")" ] && echo >> "$WL"
+		echo "$d" >> "$WL"
+		echo "$d" >> "$RUN_DIR/wl.all"
+		echo "добавлено: $d"
+		added=1
+	done
+	[ $added = 1 ] && [ "$(base_mode)" != off ] && apply
+	return 0
+}
+
+cmd_deny() {
+	[ $# -gt 0 ] || die "укажите домен"
+	[ -f "$WL" ] || die "белый список пуст ($WL не найден)"
+	# сначала записать свежие ответы DNS, чтобы знать все IP удаляемых доменов
+	[ "$(base_mode)" = off ] || cmd_flush
+	mkdir -p "$RUN_DIR"
+	removed=
+	for a in "$@"; do
+		d=$(norm "$a")
+		valid_entry "$d" || { echo "пропущено (неверный формат): $a" >&2; continue; }
+		# удаляем сам домен и все его поддомены
+		awk -v d="$d" '{
+			s = $0; sub(/#.*/, "", s); gsub(/[[:space:]]/, "", s); s = tolower(s)
+			if (s == d || (length(s) > length(d) && substr(s, length(s) - length(d)) == "." d)) next
+			print }' "$WL" > "$WL.tmp"
+		if cmp -s "$WL" "$WL.tmp"; then
+			rm -f "$WL.tmp"
+			wl_entries > "$RUN_DIR/wl.all"
+			if c=$(covered_by "$d"); then echo "$d разрешён записью «$c» — удалите её"; else echo "нет в списке: $d"; fi
+		else
+			mv "$WL.tmp" "$WL"; echo "удалено: $d (и поддомены)"; removed="$removed $d"
+		fi
+	done
+	if [ -n "$removed" ] && [ "$(base_mode)" != off ]; then
+		apply
+		for d in $removed; do drop_resolved "$d"; done
+	fi
+	return 0
+}
+
+cmd_list() {
+	if [ "$1" = --raw ]; then
+		wl_entries | awk '{ print $0 "\t" ((index($0, ":") || $0 ~ /^[0-9.\/]+$/) ? "ip" : "domain") }'
+	else
+		wl_entries
+	fi
+}
+
+cmd_mode() {
+	case $1 in
+	"") echo "$(base_mode) (фактически: $(eff_mode))";;
+	enforce|learn|off)
+		echo "$1" > "$MODE_FILE"
+		rm -f "$OPEN_FILE"
+		if [ "$1" = off ]; then
+			"$INIT" stop
+			nft delete table $TABLE 2>/dev/null
+		else
+			apply
+		fi
+		echo "Режим: $1";;
+	*) die "режимы: enforce | learn | off";;
+	esac
+}
+
+cmd_open() {
+	min=$1
+	is_num "$min" && [ "$min" -ge 1 ] && [ "$min" -le 1440 ] || die "укажите минуты (1..1440)"
+	[ "$(base_mode)" = enforce ] || die "временное открытие работает только в режиме enforce"
+	until=$(( $(date +%s) + min * 60 ))
+	mkdir -p "$RUN_DIR"
+	echo "$until" > "$OPEN_FILE"
+	apply
+	echo "Доступ открыт (с записью всех запросов) до $(date -d "@$until" +%H:%M)."
+	echo "Потом посмотрите «kidsctl pending» и добавьте нужное."
+}
+
+cmd_close() {
+	rm -f "$OPEN_FILE"
+	[ "$(base_mode)" = off ] || apply
+	echo "Временный доступ закрыт."
+}
+
+# каждую минуту по cron: временный доступ, самовосстановление, размер лога
+cmd_tick() {
+	[ "$(base_mode)" = off ] && return 0
+	take_lock tick 0 || return 0
+	if [ -f "$OPEN_FILE" ] && [ "$(date +%s)" -ge "$(read_num "$OPEN_FILE")" ]; then
+		rm -f "$OPEN_FILE"
+		logger -t kidsfilter "временный доступ закрыт по таймеру"
+		apply
+	elif ! nft list tables 2>/dev/null | grep -q " kidsfilter$"; then
+		# таблицу кто-то удалил (например, «nft flush ruleset») — восстановить
+		logger -t kidsfilter "таблица nftables пропала — восстанавливаю"
+		apply
+	elif [ -z "$(dns_pid)" ]; then
+		logger -t kidsfilter "детский DNS не работает — перезапуск"
+		apply
+	elif [ -f "$DNS_LOG" ] && [ "$(wc -c < "$DNS_LOG")" -gt $((LOG_MAX_KB * 1024)) ]; then
+		cmd_flush try
+	fi
+	drop_lock tick
+}
+
+cmd_kid() {
+	case $1 in
+	add)
+		force=0
+		[ "$2" = --force ] && { force=1; shift; }
+		name=$2
+		mac=$(printf '%s' "$3" | tr 'A-Z-' 'a-z:')
+		case $name$mac in *"$NL"*) die "имя и MAC — одной строкой";; esac
+		[ -n "$name" ] && [ ${#name} -le 32 ] && printf '%s\n' "$name" | grep -qE '^[^][:space:]#<>&"'"'"'\\[]+$' ||
+			die "имя без пробелов и спецсимволов, до 32 знаков, например: kidsctl kid add Masha aa:bb:cc:dd:ee:ff"
+		printf '%s\n' "$mac" | grep -qE "$RE_MAC" || die "неверный MAC: $3"
+		kid_list | awk -v m="$mac" '$2 == m { found = 1 } END { exit !found }' && die "MAC $mac уже есть в списке"
+		if [ $force = 0 ]; then
+			# не отрезать доступ к роутеру тому, кто сейчас им управляет
+			admin_ips > "$RUN_DIR/admin.ips" 2>/dev/null
+			hit=$({ [ -f /tmp/dhcp.leases ] && awk '{ print $3, tolower($2) }' /tmp/dhcp.leases; neigh_pairs; } |
+				awk -v m="$mac" -v A="$RUN_DIR/admin.ips" "$AWK_IP"'FILENAME == A { a[$1] = 1; next } $2 == m && (norm_ip($1) in a) { print $1; exit }' "$RUN_DIR/admin.ips" -)
+			rm -f "$RUN_DIR/admin.ips"
+			if [ -n "$hit" ]; then
+				echo "С этого устройства ($hit) сейчас открыто управление роутером." >&2
+				echo "Если сделать его детским, оно потеряет доступ к роутеру (веб-интерфейс и SSH)." >&2
+				echo "Если вы уверены, повторите с --force: kidsctl kid add --force $name $mac" >&2
+				exit 3
+			fi
+		fi
+		[ -s "$KIDS" ] && [ -n "$(tail -c 1 "$KIDS")" ] && echo >> "$KIDS"
+		echo "$name $mac" >> "$KIDS"
+		echo "добавлено: $name $mac"
+		[ "$(base_mode)" = off ] || apply;;
+	del)
+		shift
+		[ $# -gt 0 ] || die "укажите имя или MAC"
+		[ -f "$KIDS" ] || die "список детей пуст ($KIDS не найден)"
+		removed=0
+		for a in "$@"; do
+			x=$(printf '%s' "$a" | tr 'A-Z-' 'a-z:')
+			awk -v x="$x" -v n="$a" '{ s = $0; sub(/#.*/, "", s); split(s, f, " ")
+				if (f[1] == n || tolower(f[2]) == x) next; print }' "$KIDS" > "$KIDS.tmp"
+			if cmp -s "$KIDS" "$KIDS.tmp"; then
+				rm -f "$KIDS.tmp"; echo "не найдено: $a" >&2
+			else
+				mv "$KIDS.tmp" "$KIDS"; echo "удалено: $a"; removed=1
+			fi
+		done
+		[ $removed = 1 ] || exit 1
+		[ "$(base_mode)" = off ] || apply;;
+	list|"")
+		refresh_ipmap
+		kid_list | while read -r name mac; do
+			ips=$({ [ -f /tmp/dhcp.leases ] && awk -v m="$mac" 'tolower($2) == m { print $3 }' /tmp/dhcp.leases
+				neigh_pairs | awk -v m="$mac" '$2 == m { print $1 }'; } | sort -u | join_comma)
+			if [ "$2" = --raw ]; then
+				printf '%s\t%s\t%s\n' "$name" "$mac" "$ips"
+			else
+				printf '  %-12s %s  %s\n' "$name" "$mac" "${ips:-(не в сети)}"
+			fi
+		done;;
+	devices)
+		# все устройства в LAN: активные (таблица соседей ARP/NDP) и из DHCP-аренд
+		# --raw: «MAC  IP  имя_хоста  в_сети(1/0)  имя_ребёнка  управляет_роутером(1/0)»
+		mkdir -p "$RUN_DIR"
+		kid_list > "$RUN_DIR/dev.kids"
+		{ [ -f /tmp/dhcp.leases ] && cat /tmp/dhcp.leases; } > "$RUN_DIR/dev.leases"
+		for i in $LAN_IF; do ip -4 neigh show dev "$i"; ip -6 neigh show dev "$i"; done > "$RUN_DIR/dev.neigh" 2>/dev/null
+		admin_ips > "$RUN_DIR/dev.admin" 2>/dev/null
+		awk -v K="$RUN_DIR/dev.kids" -v L="$RUN_DIR/dev.leases" -v A="$RUN_DIR/dev.admin" "$AWK_IP"'
+			FILENAME == K { kid[$2] = $1; next }
+			FILENAME == A { adm[$1] = 1; next }
+			FILENAME == L { m = tolower($2); if (m !~ /^([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]$/) next
+				seen[m] = 1; if ($4 != "*") host[m] = $4; lease[m] = $3; if (norm_ip($3) in adm) isadm[m] = 1; next }
+			{
+				m = ""; for (i = 2; i < NF; i++) if ($i == "lladdr") m = tolower($(i+1))
+				if (m == "" || $NF ~ /FAILED|INCOMPLETE/) next
+				seen[m] = 1; on[m] = 1
+				if (norm_ip($1) in adm) isadm[m] = 1
+				if ($1 ~ /:/) { if (!(m in v6) || v6[m] ~ /^fe80/) v6[m] = $1 }
+				else if (index("," v4[m] ",", "," $1 ",") == 0) v4[m] = v4[m] (v4[m] == "" ? "" : ",") $1
+			}
+			END { for (m in seen) {
+				ip = (m in v4) ? v4[m] : (m in lease) ? lease[m] : v6[m]
+				printf "%d%d%s\t%s\t%s\t%s\t%d\t%s\t%d\n", (m in kid), !(m in on), host[m], m, ip, host[m], (m in on), kid[m], (m in isadm) } }
+		' "$RUN_DIR/dev.kids" "$RUN_DIR/dev.leases" "$RUN_DIR/dev.admin" "$RUN_DIR/dev.neigh" | sort | cut -f2- > "$RUN_DIR/dev.out"
+		if [ "$2" = --raw ]; then
+			cat "$RUN_DIR/dev.out"
+		else
+			awk -F '\t' '{ printf "  %-17s %-15s %-20s %-9s %s%s\n", $1, $2, ($3 == "" ? "-" : $3),
+				($4 ? "в сети" : "не в сети"), ($5 == "" ? "" : "ребёнок: " $5), ($6 ? " (управляет роутером)" : "") }' "$RUN_DIR/dev.out"
+		fi
+		rm -f "$RUN_DIR"/dev.*;;
+	*) die "kid add [--force] <имя> <MAC> | kid del <имя|MAC>... | kid list | kid devices";;
+	esac
+}
+
+cmd_dns() {
+	case $1 in
+	"") dns_label; return;;
+	--raw) dns_list; return;;
+	presets) printf '%s\n' "$DNS_PRESETS"; return;;
+	router|default)
+		rm -f "$DNS_FILE";;
+	*)
+		p=$(printf '%s\n' "$DNS_PRESETS" | awk -F '|' -v n="$1" '$1 == n { print $2 }')
+		[ -n "$p" ] && set -- $p
+		list=
+		for a in $(printf '%s ' "$@" | tr 'A-Z,' 'a-z '); do
+			ip=${a%%#*}; port=${a#"$ip"}; port=${port#\#}
+			[ -n "$(printf '%s\n' "$ip" | ip_filter any noprefix)" ] && { [ -z "$port" ] || { is_num "$port" && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; }; } ||
+				die "неверный адрес DNS: $a (нужен IP, можно с портом: 1.2.3.4#5353)"
+			[ "$port" = "$DNS_PORT" ] && die "порт $DNS_PORT занят самим фильтром"
+			list="$list $ip${port:+#$port}"
+		done
+		[ -n "$list" ] || die "укажите адреса DNS"
+		echo $list > "$DNS_FILE";;
+	esac
+	echo "DNS для детей: $(dns_label)"
+	[ "$(base_mode)" = off ] || apply
+}
+
+cmd_blockpage() {
+	case $1 in
+	"")
+		if blockpage_active; then echo "Страница блокировки: включена (порт $BLOCK_PORT)"
+		else echo "Страница блокировки: не показывается — $(blockpage_problem)"; fi
+		return;;
+	on) rm -f "$BLOCK_FILE";;
+	off) echo off > "$BLOCK_FILE";;
+	--listen) blockpage_listen; return;;
+	*) die "blockpage [on|off]";;
+	esac
+	cmd_blockpage
+	[ "$(base_mode)" = off ] || apply
+}
+
+counter_val() { nft list counter $TABLE "$1" 2>/dev/null | grep -o 'packets [0-9]*' | cut -d' ' -f2; }
+set_size() { nft list set $TABLE "$1" 2>/dev/null | sed -n '/elements/,/}/p' | tr ',' '\n' | grep -cE '[0-9a-f]+[.:][0-9a-f:.]+'; }
+
+# состояние в виде «ключ<TAB>значение» (для веб-интерфейса)
+status_raw() {
+	loaded=0; nft list tables 2>/dev/null | grep -q " kidsfilter$" && loaded=1
+	until=$(read_num "$OPEN_FILE")
+	[ "$(eff_mode)" = learn ] && [ "$(base_mode)" = enforce ] || until=0
+	cat <<EOF
+version	$VERSION
+mode	$(base_mode)
+effective	$(eff_mode)
+open_until	$until
+open_until_hm	$([ "$until" -gt 0 ] && date -d "@$until" +%H:%M)
+dns_pid	$(dns_pid)
+dns_label	$(dns_label)
+dns_servers	$(dns_list)
+wl_domains	$(wl_domains | wc -l)
+wl_ips	$(( $(wl_ip4 | wc -l) + $(wl_ip6 | wc -l) ))
+kids	$(kid_macs | wc -l)
+table	$loaded
+allow4	$([ $loaded = 1 ] && set_size allow4)
+allow6	$([ $loaded = 1 ] && set_size allow6)
+dns_redirected	$([ $loaded = 1 ] && counter_val dns_redirected)
+fwd_blocked	$([ $loaded = 1 ] && counter_val fwd_blocked)
+router_blocked	$([ $loaded = 1 ] && counter_val router_blocked)
+blockpage	$(blockpage_on && echo 1 || echo 0)
+blockpage_problem	$(blockpage_problem)
+blockpage_shown	$([ $loaded = 1 ] && counter_val blockpage_shown)
+stats_kb	$(du -sk "$STATS_DIR" 2>/dev/null | cut -f1)
+stats_max_kb	$STATS_MAX_KB
+lan_if	$LAN_IF
+EOF
+}
+
+cmd_status() {
+	[ "$1" = --raw ] && { status_raw; return; }
+	echo "Режим:           $(base_mode)"
+	if [ "$(eff_mode)" = learn ] && [ "$(base_mode)" = enforce ]; then
+		echo "                 временно открыт до $(date -d "@$(read_num "$OPEN_FILE")" +%H:%M)"
+	fi
+	pid=$(dns_pid)
+	if [ -n "$pid" ]; then echo "DNS-фильтр:      работает (pid $pid)"; else echo "DNS-фильтр:      не запущен"; fi
+	echo "DNS для детей:   $(dns_label)"
+	if blockpage_active; then echo "Стр. блокировки: включена"; else echo "Стр. блокировки: не показывается — $(blockpage_problem)"; fi
+	echo "Белый список:    $(wl_domains | wc -l) доменов, $(( $(wl_ip4 | wc -l) + $(wl_ip6 | wc -l) )) IP/сетей"
+	if nft list tables 2>/dev/null | grep -q " kidsfilter$"; then
+		echo "Разрешённых IP:  $(set_size allow4) IPv4, $(set_size allow6) IPv6 (наполняются по DNS)"
+		echo "Счётчики:        DNS-запросов перехвачено $(counter_val dns_redirected), соединений заблокировано $(counter_val fwd_blocked), обращений к роутеру отклонено $(counter_val router_blocked), страниц блокировки показано $(counter_val blockpage_shown)"
+	else
+		echo "nftables:        таблица не загружена"
+	fi
+	echo "Дети:"
+	cmd_kid list
+}
+
+usage() {
+	cat <<'EOF'
+kidsctl — белый список сайтов для детских компьютеров
+
+  status                    состояние, счётчики, дети в сети
+  mode [enforce|learn|off]  enforce — только белый список
+                            learn   — всё открыто, все запросы пишутся (обучение)
+                            off     — фильтр выключен
+  open <мин> / close        временно открыть доступ (в enforce), с записью запросов
+  pending [дней]            домены вне белого списка (кандидаты на добавление)
+  allow <домен|URL|IP>...   разрешить (вместе с поддоменами)
+  deny <домен>...           убрать из списка
+  list                      белый список
+  stats [дней]              статистика по детям: топ сайтов, часы активности
+  log                       запросы в реальном времени
+  blocked [N]               последние заблокированные соединения по IP
+  dns [router|yandex|cloudflare|adguard|<IP>...]
+                            через какой DNS разрешать имена для детей
+                            (router — DNS роутера; остальные — семейные фильтры)
+  blockpage [on|off]        страница «Сайт закрыт» вместо ошибки браузера (в enforce)
+  kid add [--force] <имя> <MAC> | kid del <имя|MAC>... | kid list
+  kid devices               все устройства в сети (активные и из DHCP-аренд)
+  restart                   перезапустить фильтр
+  version                   версия
+
+Веб-интерфейс: LuCI → Службы → Детский фильтр.
+EOF
+}
+
+cmd=$1
+[ $# -gt 0 ] && shift
+case $cmd in
+	status|"") cmd_status "$@";;
+	mode) cmd_mode "$@";;
+	open) cmd_open "$@";;
+	close) cmd_close;;
+	pending) cmd_pending "$@";;
+	allow|add) cmd_allow "$@";;
+	deny|del|rm) cmd_deny "$@";;
+	list|ls) cmd_list "$@";;
+	stats) cmd_stats "$@";;
+	tail) cmd_tail "$@";;
+	log) cmd_log;;
+	blocked) cmd_blocked "$@";;
+	kid|kids) cmd_kid "$@";;
+	dns) cmd_dns "$@";;
+	blockpage) cmd_blockpage "$@";;
+	flush) cmd_flush "$@";;
+	save) cmd_save;;
+	tick) cmd_tick;;
+	prepare) cmd_prepare;;
+	restart) [ "$(base_mode)" = off ] && die "фильтр выключен (kidsctl mode learn|enforce)"; apply; echo "Фильтр перезапущен.";;
+	effmode) eff_mode;;
+	version) echo "$VERSION";;
+	help|-h|--help) usage;;
+	*) usage; exit 1;;
+esac

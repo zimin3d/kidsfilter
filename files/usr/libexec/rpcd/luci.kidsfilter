@@ -1,0 +1,171 @@
+#!/bin/sh
+# rpcd-плагин luci-app-kidsfilter: ubus-объект luci.kidsfilter для веб-интерфейса.
+# Вся логика и проверка ввода — в kidsctl; здесь только разбор JSON и вывод результата.
+
+. /usr/share/libubox/jshn.sh
+
+K=/usr/bin/kidsctl
+set -f
+
+# TSV со stdin -> JSON-массив объектов. $1 — имена полей через запятую, «:n» — число.
+# Кавычки, обратные слэши и управляющие символы из значений выбрасываются (в доменах и именах их нет).
+tsv_json() {
+	awk -F '\t' -v f="$1" '
+	function esc(s) { gsub(/["\\]/, "", s); gsub(/[[:cntrl:]]/, "", s); return s }
+	BEGIN { n = split(f, F, ","); printf "[" }
+	{
+		printf "%s{", (NR > 1 ? "," : "")
+		for (i = 1; i <= n; i++) {
+			split(F[i], t, ":")
+			if (t[2] == "n") printf "%s\"%s\":%d", (i > 1 ? "," : ""), t[1], $i + 0
+			else printf "%s\"%s\":\"%s\"", (i > 1 ? "," : ""), t[1], esc($i)
+		}
+		printf "}"
+	}
+	END { printf "]" }'
+}
+
+# «ключ<TAB>значение» -> JSON-объект со строковыми значениями
+kv_json() {
+	awk -F '\t' '
+	function esc(s) { gsub(/["\\]/, "", s); gsub(/[[:cntrl:]]/, "", s); return s }
+	BEGIN { printf "{" }
+	{ printf "%s\"%s\":\"%s\"", (NR > 1 ? "," : ""), esc($1), esc($2) }
+	END { printf "}" }'
+}
+
+rows() { printf '{"rows":%s}\n' "$(tsv_json "$1")"; }
+
+# число из входного JSON с проверкой и значением по умолчанию
+num_arg() {
+	json_get_var v "$1"
+	case $v in ''|*[!0-9]*) v=$2;; esac
+	echo "$v"
+}
+
+# элементы массива items по одному в строке (не больше 500)
+items() {
+	json_select items 2>/dev/null || return 0
+	json_get_keys keys
+	n=0
+	for k in $keys; do
+		n=$((n + 1)); [ $n -gt 500 ] && break
+		json_get_var v "$k"
+		printf '%s\n' "$v"
+	done
+	json_select ..
+}
+
+# выполнить команду kidsctl и вернуть {ok, code, output}
+action() {
+	out=$("$@" 2>&1)
+	rc=$?
+	json_init
+	json_add_boolean ok "$([ $rc = 0 ] && echo 1 || echo 0)"
+	json_add_int code "$rc"
+	json_add_string output "$out"
+	json_dump
+}
+
+# action с аргументами из items (каждый элемент — отдельный аргумент, без разбиения по пробелам)
+action_items() {
+	list=$(items)
+	[ -n "$list" ] || { action echo "Ничего не выбрано"; return; }
+	set -- "$@"
+	old_ifs=$IFS; IFS='
+'
+	# shellcheck disable=SC2086
+	set -- "$@" $list
+	IFS=$old_ifs
+	action "$@"
+}
+
+case "$1" in
+list)
+	cat <<'EOF'
+{
+	"status": {},
+	"kids": {},
+	"devices": {},
+	"whitelist": {},
+	"pending": { "days": 1 },
+	"stats": { "days": 1 },
+	"log": { "lines": 100 },
+	"blocked": { "lines": 50 },
+	"dns": {},
+	"set_mode": { "mode": "learn" },
+	"open": { "minutes": 30 },
+	"close": {},
+	"allow": { "items": [] },
+	"deny": { "items": [] },
+	"kid_add": { "name": "name", "mac": "mac", "force": false },
+	"kid_del": { "items": [] },
+	"set_dns": { "servers": "router" },
+	"set_blockpage": { "enabled": true },
+	"restart": {}
+}
+EOF
+	;;
+call)
+	input=$(cat)
+	[ -n "$input" ] || input='{}'
+	json_load "$input" 2>/dev/null || json_load '{}'
+	case "$2" in
+	status)
+		$K status --raw | kv_json; echo;;
+	kids)
+		$K kid list --raw | rows "name,mac,ips";;
+	devices)
+		$K kid devices --raw | rows "mac,ip,host,online:n,kid,admin:n";;
+	whitelist)
+		$K list --raw | rows "entry,type";;
+	pending)
+		$K pending --raw "$(num_arg days 1)" | head -n 500 | rows "count:n,domain,base,kids";;
+	stats)
+		# T/S/H/Y — см. stats_raw в kidsctl; поля a, b — по смыслу строки
+		$K stats --raw "$(num_arg days 1)" | rows "t,kid,a,b:n,c:n";;
+	log)
+		$K tail "$(num_arg lines 100)" | rows "time,kid,domain,listed:n";;
+	blocked)
+		$K blocked --raw "$(num_arg lines 50)" | rows "time,kid,dst,port,proto";;
+	dns)
+		printf '{"servers":"%s","label":"%s","presets":%s}\n' \
+			"$($K dns --raw | tr -d '"\\')" "$($K dns | tr -d '"\\')" \
+			"$($K dns presets | tr '|' '\t' | tsv_json "id,servers,title")";;
+	set_mode)
+		json_get_var mode mode
+		case $mode in
+			enforce|learn|off) action $K mode "$mode";;
+			*) action echo "Неизвестный режим";;
+		esac;;
+	open)
+		action $K open "$(num_arg minutes 0)";;
+	close)
+		action $K close;;
+	allow)
+		action_items $K allow;;
+	deny)
+		action_items $K deny;;
+	kid_add)
+		json_get_var name name
+		json_get_var mac mac
+		json_get_var force force
+		if [ "$force" = 1 ]; then action $K kid add --force "$name" "$mac"
+		else action $K kid add "$name" "$mac"; fi;;
+	kid_del)
+		action_items $K kid del;;
+	set_dns)
+		json_get_var servers servers
+		# разбиение по пробелам здесь намеренное: несколько адресов в одной строке (globbing отключён)
+		# shellcheck disable=SC2086
+		action $K dns $servers;;
+	set_blockpage)
+		json_get_var enabled enabled
+		if [ "$enabled" = 1 ]; then action $K blockpage on; else action $K blockpage off; fi;;
+	restart)
+		action $K restart;;
+	*)
+		echo '{"error":"unknown method"}';;
+	esac
+	;;
+esac

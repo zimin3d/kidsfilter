@@ -1,0 +1,53 @@
+{
+	"admin/services/kidsfilter": {
+		"title": "Детский фильтр",
+		"order": 60,
+		"action": {
+			"type": "alias",
+			"path": "admin/services/kidsfilter/overview"
+		},
+		"depends": {
+			"acl": [ "luci-app-kidsfilter" ]
+		}
+	},
+	"admin/services/kidsfilter/overview": {
+		"title": "Обзор",
+		"order": 10,
+		"action": {
+			"type": "view",
+			"path": "kidsfilter/overview"
+		}
+	},
+	"admin/services/kidsfilter/kids": {
+		"title": "Дети",
+		"order": 20,
+		"action": {
+			"type": "view",
+			"path": "kidsfilter/kids"
+		}
+	},
+	"admin/services/kidsfilter/learn": {
+		"title": "Обучение",
+		"order": 30,
+		"action": {
+			"type": "view",
+			"path": "kidsfilter/learn"
+		}
+	},
+	"admin/services/kidsfilter/whitelist": {
+		"title": "Белый список",
+		"order": 40,
+		"action": {
+			"type": "view",
+			"path": "kidsfilter/whitelist"
+		}
+	},
+	"admin/services/kidsfilter/stats": {
+		"title": "Статистика",
+		"order": 50,
+		"action": {
+			"type": "view",
+			"path": "kidsfilter/stats"
+		}
+	}
+}

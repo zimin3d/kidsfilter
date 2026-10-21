@@ -1,0 +1,6 @@
+# Детские устройства: <имя> <MAC>
+# Если компьютер подключается и по кабелю, и по Wi-Fi — укажите оба MAC.
+# Добавлять удобнее командой: kidsctl kid add Masha aa:bb:cc:dd:ee:ff
+#
+# Masha   aa:bb:cc:dd:ee:01
+# Petya   aa:bb:cc:dd:ee:02

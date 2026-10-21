@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<meta http-equiv="Cache-Control" content="no-store">
+<title>Сайт закрыт</title>
+<!-- Страница блокировки kidsfilter. Свою версию можно положить в /etc/kidsfilter/blocked.html -->
+<style>
+:root { --bg: #f4f6fb; --card: #fff; --text: #1d2330; --muted: #5d6677; --accent: #2860d8; --line: #dde1e7; }
+@media (prefers-color-scheme: dark) {
+	:root { --bg: #14171d; --card: #1d2129; --text: #e6e8ec; --muted: #9aa3b2; --accent: #7aa2ff; --line: #2c323d; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+	padding: 16px; background: var(--bg); color: var(--text); font: 17px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 34em; width: 100%; background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 28px 26px; }
+.icon { font-size: 44px; line-height: 1; }
+h1 { font-size: 1.45em; margin: 12px 0 8px; }
+.site { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .95em; word-break: break-all;
+	background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin: 14px 0; }
+p { margin: 10px 0; }
+.muted { color: var(--muted); font-size: .88em; border-top: 1px solid var(--line); padding-top: 12px; margin-top: 18px; }
+</style>
+</head>
+<body>
+<main>
+	<div class="icon" aria-hidden="true">🔒</div>
+	<h1>Этот сайт закрыт</h1>
+	<p>Сайт не входит в список разрешённых на этом компьютере.</p>
+	<div class="site" id="site">—</div>
+	<p>Если он нужен для учёбы или для дела, попроси родителей его разрешить и назови им адрес выше.</p>
+	<p class="muted">Для родителей: адрес уже записан. Его можно разрешить в LuCI → Службы → Детский фильтр → «Обучение»
+	или командой <code>kidsctl allow <span id="host">домен</span></code>.
+	Если сайт уже разрешили, а страница всё ещё появляется, обновите её (Ctrl+F5).
+	<br><span id="time"></span></p>
+</main>
+<script>
+(function () {
+	var host = location.hostname || '';
+	var path = location.pathname + location.search;
+	// textContent: адрес выводится как текст, никакой разметки из него не исполняется
+	document.getElementById('site').textContent = host + (path && path != '/' ? path : '');
+	if (host) document.getElementById('host').textContent = host;
+	var d = new Date();
+	document.getElementById('time').textContent = 'Время: ' + d.toLocaleString('ru-RU');
+})();
+</script>
+</body>
+</html>

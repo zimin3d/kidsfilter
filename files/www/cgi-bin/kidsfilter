@@ -1,0 +1,257 @@
+#!/bin/sh
+# Веб-панель kidsfilter: http://<адрес роутера>/cgi-bin/kidsfilter
+# Вход — логин root и пароль роутера (настраивается в /etc/httpd.conf установщиком).
+
+K=/usr/bin/kidsctl
+set -f
+
+MSG=/var/run/kidsfilter/webmsg
+TOKF=/var/run/kidsfilter/webtoken
+esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'; }
+
+# раскодирует значение поля формы (в том числе кириллицу) через восьмеричные escape-коды для printf %b
+urldec() {
+	printf '%b' "$(printf '%s' "$1" | awk '
+	BEGIN { h = "0123456789abcdef" }
+	{
+		s = $0; gsub(/\+/, " ", s); gsub(/\\/, "\\\\", s); out = ""
+		while (match(s, /%[0-9A-Fa-f][0-9A-Fa-f]/)) {
+			x = tolower(substr(s, RSTART + 1, 2))
+			out = out substr(s, 1, RSTART - 1) sprintf("\\0%o", (index(h, substr(x, 1, 1)) - 1) * 16 + index(h, substr(x, 2, 1)) - 1)
+			s = substr(s, RSTART + 3)
+		}
+		printf "%s", out s
+	}')"
+}
+
+# защита от отправки формы с чужих страниц: в каждой форме секретный токен
+# (новый после перезагрузки роутера; не зависит от заголовка Referer)
+if [ ! -s "$TOKF" ]; then
+	mkdir -p "${TOKF%/*}"
+	(umask 077; tr -d '-' < /proc/sys/kernel/random/uuid > "$TOKF")
+fi
+TOK=$(cat "$TOKF")
+
+if [ "$REQUEST_METHOD" = POST ]; then
+	len=${CONTENT_LENGTH:-0}
+	case $len in ''|*[!0-9]*) len=0;; esac
+	[ "$len" -gt 65536 ] && len=65536
+	body=$(head -c "$len")
+
+	act= ds= min= mode= days=1 name= mac= ks= dns= tok= bp=
+	for kv in $(printf '%s' "$body" | tr '&' ' '); do
+		k=${kv%%=*}; v=${kv#*=}
+		case $k in
+			a) act=$v;;
+			t) tok=$v;;
+			d) # вставленная ссылка: раскодировать символы URL; kidsctl оставит только домен
+				v=$(printf '%s' "$v" | sed -e 's/%3[Aa]/:/g' -e 's#%2[Ff]#/#g' -e 's/%3[Ff]/?/g' \
+					-e 's/%3[Dd]/=/g' -e 's/%2[Dd]/-/g' -e 's/%2[Ee]/./g' -e 's/%..//g' -e 's/+//g')
+				ds="$ds $v";;
+			m) min=$v;;
+			mode) mode=$v;;
+			days) days=$v;;
+			n) name=$(urldec "$v");;
+			mac) mac=$(urldec "$v");;
+			k) ks="$ks $(urldec "$v")";;
+			dns) dns=$(urldec "$v");;
+			bp) bp=$v;;
+		esac
+	done
+	case $days in ''|*[!0-9]*) days=1;; esac
+	if [ -z "$tok" ] || [ "$tok" != "$TOK" ]; then
+		printf 'Status: 403 Forbidden\r\nContent-Type: text/html; charset=utf-8\r\n\r\n'
+		printf '<p>Страница устарела (например, роутер перезагружался). <a href="%s">Откройте панель заново</a> и повторите.</p>\n' "$SCRIPT_NAME"
+		exit 0
+	fi
+	# kidsctl сам проверяет формат каждого домена, имени и MAC
+	mkdir -p "${MSG%/*}"
+	case $act in
+		allow) [ -n "$ds" ] && $K allow $ds;;
+		deny) [ -n "$ds" ] && $K deny $ds;;
+		mode) case $mode in enforce|learn|off) $K mode "$mode";; esac;;
+		open) case $min in ''|*[!0-9]*) ;; *) $K open "$min";; esac;;
+		close) $K close;;
+		kidadd) $K kid add "$name" "$mac";;
+		kiddel) [ -n "$ks" ] && $K kid del $ks;;
+		dns) [ -n "$dns" ] && $K dns $dns;;
+		blockpage) case $bp in on|off) $K blockpage "$bp";; esac;;
+	esac > "$MSG" 2>&1
+	printf 'Status: 303 See Other\r\nLocation: %s?days=%s\r\n\r\n' "$SCRIPT_NAME" "$days"
+	exit 0
+fi
+
+days=$(printf '%s' "$QUERY_STRING" | sed -n 's/.*days=\([0-9][0-9]*\).*/\1/p')
+[ -n "$days" ] && [ "$days" -ge 1 ] 2>/dev/null || days=1
+# скрытые поля каждой формы
+H="<input type=\"hidden\" name=\"days\" value=\"$days\"><input type=\"hidden\" name=\"t\" value=\"$TOK\">"
+# лог переносим в статистику один раз, а не в каждом pending/stats (каждый раз ждёт 1 с)
+$K flush 2>/dev/null
+export KIDSCTL_NOFLUSH=1
+
+mode=$($K mode | cut -d' ' -f1)
+dns=$($K dns --raw)
+bp_on=1; [ "$(cat /etc/kidsfilter/blockpage 2>/dev/null)" = off ] && bp_on=0
+bp_state=$($K blockpage)
+printf 'Content-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\n\r\n'
+cat <<EOF
+<!doctype html>
+<html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Детский фильтр</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0 auto;max-width:960px;padding:12px 16px;background:#f6f7f9;color:#1d2330}
+h1{font-size:1.4em}h2{font-size:1.1em;margin-top:1.6em}
+.card{background:#fff;border:1px solid #dde1e7;border-radius:8px;padding:12px 14px;margin:10px 0;overflow-x:auto}
+pre{font-size:13px;margin:0;white-space:pre}
+table{border-collapse:collapse;width:100%;font-size:14px}
+td,th{padding:4px 6px;border-bottom:1px solid #eef0f3;text-align:left}td.n{text-align:right;color:#666}
+button{padding:6px 12px;border-radius:6px;border:1px solid #b8c0cc;background:#fff;cursor:pointer;margin:2px}
+button.on{background:#2860d8;color:#fff;border-color:#2860d8}
+.muted{color:#777;font-size:13px}input[type=number]{width:5em;padding:5px}
+input[type=text]{padding:5px;max-width:100%}.msg{background:#fff8e1;border-color:#f0d58c}
+.online{color:#1a7f37}.offline{color:#999}
+</style></head><body>
+<h1>Детский фильтр</h1>
+EOF
+if [ -s "$MSG" ]; then
+	echo "<div class=\"card msg\"><pre>$(esc < "$MSG")</pre></div>"
+	rm -f "$MSG"
+fi
+cat <<EOF
+<div class="card"><pre>$($K status 2>&1 | esc)</pre></div>
+
+<div class="card">
+<form method="post" style="display:inline"><input type="hidden" name="a" value="mode">$H
+<b>Режим:</b>
+<button name="mode" value="enforce" class="$([ "$mode" = enforce ] && echo on)">Только белый список</button>
+<button name="mode" value="learn" class="$([ "$mode" = learn ] && echo on)">Обучение (всё открыто)</button>
+<button name="mode" value="off" class="$([ "$mode" = off ] && echo on)">Выключен</button>
+</form><br>
+<form method="post" style="display:inline"><input type="hidden" name="a" value="open">$H
+Открыть временно на <input type="number" name="m" value="30" min="1" max="1440"> мин <button>Открыть</button>
+</form>
+<form method="post" style="display:inline"><input type="hidden" name="a" value="close">$H<button>Закрыть</button></form>
+<div class="muted">Временное открытие: всё доступно, но все запросы пишутся — потом добавьте нужное из списка ниже.</div>
+</div>
+
+<h2>DNS для детей</h2>
+<div class="card">
+<form method="post"><input type="hidden" name="a" value="dns">$H
+<button name="dns" value="router" class="$([ -z "$dns" ] && echo on)">DNS роутера</button>
+EOF
+
+$K dns presets | esc | awk -F '|' -v cur="$(printf '%s' "$dns" | esc)" '
+	{ printf "<button name=dns value=\"%s\" title=\"%s\"%s>%s</button>\n", $1, $2, ($2 == cur ? " class=on" : ""), $3 }'
+
+cat <<EOF
+</form>
+<form method="post"><input type="hidden" name="a" value="dns">$H
+Свои серверы: <input type="text" name="dns" value="$(printf '%s' "$dns" | esc)" placeholder="1.2.3.4 5.6.7.8" style="width:50%"> <button>Сохранить</button>
+</form>
+<div class="muted">Через этот DNS разрешаются имена для всех детских устройств (остальные устройства не затрагиваются).
+Семейные DNS дополнительно блокируют сайты для взрослых и включают безопасный поиск — полезно в режиме обучения и при временном открытии.
+В режиме «только белый список» по-прежнему открываются только сайты из списка.</div>
+</div>
+
+<h2>Страница блокировки</h2>
+<div class="card">
+<form method="post"><input type="hidden" name="a" value="blockpage">$H
+<button name="bp" value="on" class="$([ "$bp_on" = 1 ] && echo on)">Показывать</button>
+<button name="bp" value="off" class="$([ "$bp_on" = 1 ] || echo on)">Не показывать</button>
+</form>
+<p>$(printf '%s' "$bp_state" | esc)</p>
+<div class="muted">Вместо ошибки браузера ребёнок видит страницу «Этот сайт закрыт» (в режиме «только белый список»).
+Она появляется, когда сайт открывают по http:// или набирают адрес вручную. По ссылкам https:// и на сайтах только с HTTPS
+(Google, YouTube, соцсети) браузер покажет свою ошибку соединения: подменить защищённую страницу невозможно.</div>
+</div>
+
+<h2>Дети</h2>
+<div class="card">
+<form method="post"><input type="hidden" name="a" value="kiddel">$H
+<table><tr><th></th><th>Имя</th><th>MAC</th><th>Сейчас в сети</th></tr>
+EOF
+
+$K kid list --raw 2>/dev/null | esc | awk -F '\t' '
+	{ printf "<tr><td><input type=checkbox name=k value=\"%s\"></td><td>%s</td><td><code>%s</code></td>", $2, $1, $2
+	  if ($3 != "") printf "<td class=online>%s</td></tr>\n", $3
+	  else printf "<td class=offline>не в сети</td></tr>\n" }
+	END { if (!NR) print "<tr><td colspan=4 class=muted>Детских устройств пока нет — добавьте ниже.</td></tr>" }'
+
+cat <<EOF
+</table>
+<p><button onclick="return confirm('Убрать отмеченные устройства из-под фильтра?')">Удалить отмеченные</button></p>
+</form>
+<form method="post"><input type="hidden" name="a" value="kidadd">$H
+Добавить: <input type="text" name="n" placeholder="Имя (без пробелов)" required>
+<input type="text" name="mac" placeholder="aa:bb:cc:dd:ee:ff" required pattern="([0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}">
+<button class="on">Добавить</button>
+</form>
+<div class="muted">У одного ребёнка может быть несколько устройств (кабель и Wi-Fi, ноутбук и ПК) — добавьте каждый MAC с тем же именем.
+В Windows отключите «Случайные аппаратные адреса» для домашней сети, иначе MAC будет меняться.</div>
+</div>
+
+<h2>Устройства в сети</h2>
+<div class="card">
+<table><tr><th>Устройство</th><th>IP</th><th>MAC</th><th>Состояние</th><th>Сделать детским</th></tr>
+EOF
+
+$K kid devices --raw 2>/dev/null | esc | awk -F '\t' -v H="$H" '
+	{ printf "<tr><td>%s</td><td>%s</td><td><code>%s</code></td>", ($3 == "" ? "<span class=muted>(без имени)</span>" : $3), $2, $1
+	  printf "<td class=%s</td>", ($4 ? "online>в сети" : "offline>не в сети")
+	  if ($5 != "") { printf "<td>ребёнок: <b>%s</b></td></tr>\n", $5; next }
+	  printf "<td><form method=post style=\"margin:0\"><input type=hidden name=a value=kidadd>%s", H
+	  printf "<input type=hidden name=mac value=\"%s\"><input type=text name=n value=\"%s\" placeholder=\"Имя\" required size=12> ", $1, $3
+	  printf "<button>Добавить</button></form></td></tr>\n" }
+	END { if (!NR) print "<tr><td colspan=5 class=muted>Устройства не найдены.</td></tr>" }'
+
+cat <<EOF
+</table>
+<div class="muted">Активные устройства — из таблицы соседей роутера (ARP/NDP), включая устройства со статическим IP; имена — из DHCP-аренд.
+«Не в сети» — есть аренда DHCP, но сейчас устройство не отвечает. Чтобы добавить ребёнку ещё одно устройство, впишите то же имя.</div>
+</div>
+
+<p>Период: <a href="?days=1">сегодня</a> · <a href="?days=7">7 дней</a> · <a href="?days=30">30 дней</a> (сейчас: $days дн.)</p>
+
+<h2>Запрошено, но нет в белом списке</h2>
+<div class="card">
+<form method="post"><input type="hidden" name="a" value="allow">$H
+<table><tr><th>Запросов</th><th>Домен</th><th>Весь сайт</th><th>Кто</th></tr>
+EOF
+
+$K pending --raw "$days" 2>/dev/null | head -n 300 | esc | awk -F '\t' '
+	{ printf "<tr><td class=n>%s</td><td><label><input type=checkbox name=d value=\"%s\"> %s</label></td>", $1, $2, $2
+	  if ($3 != $2) printf "<td><label><input type=checkbox name=d value=\"%s\"> *.%s</label></td>", $3, $3
+	  else printf "<td></td>"
+	  printf "<td>%s</td></tr>\n", $4 }'
+
+cat <<EOF
+</table>
+<p><button class="on">Разрешить отмеченные</button></p>
+<div class="muted">«Весь сайт» разрешает домен со всеми поддоменами (например, *.example.com).</div>
+</form></div>
+
+<h2>Статистика</h2>
+<div class="card"><pre>$($K stats "$days" 2>&1 | esc)</pre></div>
+
+<h2>Белый список</h2>
+<div class="card">
+<form method="post"><input type="hidden" name="a" value="allow">$H
+Добавить: <input name="d" placeholder="example.com или ссылка" style="width:60%;padding:5px"> <button>Добавить</button>
+</form>
+<form method="post"><input type="hidden" name="a" value="deny">$H
+<table>
+EOF
+
+$K list | esc | awk '{ printf "<tr><td><label><input type=checkbox name=d value=\"%s\"> %s</label></td></tr>\n", $1, $1 }'
+
+cat <<EOF
+</table>
+<p><button>Удалить отмеченные</button></p>
+</form></div>
+
+<h2>Заблокированные соединения по IP</h2>
+<div class="card"><pre>$($K blocked 30 2>&1 | esc)</pre>
+<div class="muted">Программы, которые подключаются по IP мимо DNS. Нужный адрес можно добавить в белый список как IP.</div></div>
+</body></html>
+EOF

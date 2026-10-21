@@ -1,0 +1,15 @@
+{
+	"luci-app-kidsfilter": {
+		"description": "Детский фильтр: белый список сайтов",
+		"read": {
+			"ubus": {
+				"luci.kidsfilter": [ "status", "kids", "devices", "whitelist", "pending", "stats", "log", "blocked", "dns" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.kidsfilter": [ "set_mode", "open", "close", "allow", "deny", "kid_add", "kid_del", "set_dns", "set_blockpage", "restart" ]
+			}
+		}
+	}
+}
